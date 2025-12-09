@@ -3,11 +3,15 @@
 /dts-v1/;
 
 #include <dt-bindings/gpio/gpio.h>
-#include <dt-bindings/input/input.h>
+#include <dt-bindings/display/media-bus-format.h>
 #include <dt-bindings/leds/common.h>
 #include <dt-bindings/pinctrl/rockchip.h>
 #include <dt-bindings/soc/rockchip,vop2.h>
 #include <dt-bindings/soc/rockchip,boot-mode.h>
+#include <dt-bindings/display/drm_mipi_dsi.h>
+#include <dt-bindings/display/rockchip_vop.h>
+#include <dt-bindings/input/rk-input.h>
+#include <dt-bindings/sensor-dev.h>
 #include "rk3566.dtsi"
 
 / {
@@ -1060,8 +1064,8 @@
 };
 
 /* 激活 DSI PHY */
-&video_phy1 {
-	status = "okay";
+&dsi_dphy1 {
+    status = "okay";
 };
 
 /* 绑定 DSI 到 VOP 端口 */
