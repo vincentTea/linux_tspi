@@ -13,9 +13,11 @@ env:
   src_path: /home/runner/work/linux/linux
   modules_path: /home/runner/work/linux/linux/modules/lib/modules
   # =======================================================
-  # [修改 1] 定义你的目标设备树名称 (不带 .dts/.dtb 后缀)
+  # [修改 1] 改回【原厂标准名称】，骗过 Rockchip 的打包脚本
   # =======================================================
-  DTB_NAME: rk3566-lckfb-tspi-hibuffx
+  DTB_NAME: rk3566-lckfb-tspi
+  # 定义一个变量用于最终文件重命名，方便区分
+  CUSTOM_SUFFIX: hibuffx
 
 jobs:
   build:
@@ -80,45 +82,41 @@ jobs:
           echo "armbian_file_path=${{ env.src_path }}/armbian_boot_files" >> $GITHUB_ENV
 
       # =======================================================
-      # [修改 2] 编译内核步骤
-      # 将写死的 rk3566-lckfb-tspi.img 替换为 ${{ env.DTB_NAME }}.img
-      # 重命名部分也同步修改，以便区分输出文件
+      # [修改 2] 偷梁换柱编译法
+      # 1. 用 hibuffx.dts 覆盖 原厂.dts
+      # 2. 用原厂名字编译（解决 Syntax error）
+      # 3. 输出改名
       # =======================================================
       - name: Build Kernel
         run: |
           mkdir -p  ${{ env.armbian_path }}/
           mkdir -p  ${{ env.armbian_file_path }}
+          
+          # 【关键步骤】覆盖文件：用你的配置覆盖原厂文件
+          echo "Overwriting standard DTS with custom Hibuffx DTS..."
+          cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dts arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dts
+
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  tspi_defconfig
-          # 屏蔽，不编译其他厂商的dtbs
-          # make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- dtbs
+          
+          # 编译 dtb (使用标准名称)
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- rockchip/${{ env.DTB_NAME }}.dtb
           
-          # 编译指定的 img (Rockchip Makefile 规则通常支持 xxx.img 对应 xxx.dts)
+          # 编译 img (使用标准名称，这下不会报错了)
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  ${{ env.DTB_NAME }}.img  -j$(nproc)
                     
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  modules_install  INSTALL_MOD_PATH=${{ env.src_path }}/modules
-          echo "${{ env.kernel_main_version }}"
-          echo  "查看编译好的boot.img"
+          
+          echo "查看编译好的boot.img"
           ls -lh boot.img
           
-          # 重命名时带上 hibuffx 标识
-          echo "重命名boot.img为${{ env.DTB_NAME }}-boot-${{ env.kernel_main_version }}.img"
-          mv boot.img  ${{ env.DTB_NAME }}-boot-${{ env.kernel_main_version }}.img
-          ls  -lh      ${{ env.DTB_NAME }}-boot-${{ env.kernel_main_version }}.img          
+          # 【重命名】加上你的后缀，方便区分
+          echo "重命名boot.img"
+          mv boot.img  rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.kernel_main_version }}.img
+          ls  -lh      rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.kernel_main_version }}.img          
           
-          echo "当前所在编译路径：$(pwd)"
           # 打包模块
           cd  ${{ env.modules_path }}
-          echo "进入modules路径：${{ env.modules_path }}"
-          echo  "查看modules"
-          ls
-          echo "${{ env.kernel_main_version }}"
-          echo "查看模块详情"
-          ls -lh ${{ env.kernel_main_version }}
-          echo "打包modules"
           tar -zcf ${{ env.kernel_main_version }}-modules.tar.gz   ${{ env.kernel_main_version }}
-          echo "查看打包的modules.tar.gz"
-          ls  -lh
 
       - name: tar ap6212_wifi_firmware
         run: |
@@ -139,14 +137,10 @@ jobs:
           cp -a .config                 ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/
           cd ${{ env.src_path }}
           tar -zcf  ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}.tar.gz   linux-headers-${{ env.kernel_main_version }}
-          echo "当前所在路径：$(pwd)"
-          echo "查看打包的linux-headers-${{ env.kernel_main_version }}.tar.gz"
-          ls  -lh ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}.tar.gz
 
       # =======================================================
-      # [修改 3] 打包文件步骤
-      # 引用上面重命名后的 boot 镜像文件名
-      # 修改最终压缩包名称，增加 hibuffx 标识
+      # [修改 3] 打包文件调整
+      # 适配上面的重命名逻辑
       # =======================================================
       - name: Compression_boot_files
         run: |
@@ -155,13 +149,13 @@ jobs:
           mv ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}.tar.gz  .
           mv ${{ env.modules_path }}/${{ env.kernel_main_version }}-modules.tar.gz   .
           
-          # 移动新的 img 文件
-          mv ${{ env.src_path }}/${{ env.DTB_NAME }}-boot-${{ env.kernel_main_version }}.img  .
+          # 移动重命名后的 img
+          mv ${{ env.src_path }}/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.kernel_main_version }}.img  .
           
           cp -a ${{ env.src_path }}/firmware/ap6212_wifi_firmware.tar.gz  .
           
-          # 最终包名改为 hibuffx
-          tar -zcvf ${{ env.DTB_NAME }}-${{ env.kernel_main_version }}.tar.gz   *
+          # 压缩包名
+          tar -zcvf rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-${{ env.kernel_main_version }}.tar.gz   *
 
       - name: create  armbian_modules
         run: |
@@ -175,39 +169,34 @@ jobs:
           tar -zcf  ${{ env.armbian_path }}/headers-${{ env.kernel_main_version }}.tar.gz   .
 
       # =======================================================
-      # [修改 4] 修改 Armbian DTB 逻辑
-      # 将原来的 rk3566-lckfb-tspi.dtb 替换为 ${{ env.DTB_NAME }}.dtb
-      # 这一步非常重要，否则 Armbian 包里的 dtb 还是旧的
+      # [修改 4] Armbian DTB 逻辑调整
+      # 这里处理的是【标准名称】的 DTB (因为我们覆盖了)
+      # 但最终打包出去改个名
       # =======================================================
       - name: edit armbian_dtb
         run: | 
           mkdir -p ${{ env.dtb_path }}/dtb/rockchip
-          echo "查看未修改前的dtb"
-          ls -lh  ${{ env.src_path }}/arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dtb
           
-          echo "复制dtb到armbian_boot路径"
-          # 复制所有 dtb 保持兼容，但后续逻辑只处理我们关注的那个
-          cp -a   ${{ env.src_path }}/arch/arm64/boot/dts/rockchip/*.dtb   ${{ env.dtb_path }}/dtb/rockchip
+          # 这里只能找到标准名称的 dtb (因为 Makefile 生成的就是这个)
+          echo "复制dtb: ${{ env.DTB_NAME }}.dtb"
+          cp -a ${{ env.src_path }}/arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dtb ${{ env.dtb_path }}/dtb/rockchip/
+          
           cd ${{ env.dtb_path }}/dtb/rockchip
           
-          echo  "反编译"
-          dtc -I dtb -O dts  ${{ env.DTB_NAME }}.dtb  -o file.dts
+          echo "反编译标准名称 DTB"
+          dtc -I dtb -O dts ${{ env.DTB_NAME }}.dtb -o file.dts
           
-          echo "删除未修改的dtb"
-          rm -rf ${{ env.DTB_NAME }}.dtb
+          echo "修改dts (移除 mmcblk0p3 锁定)"
+          sed -i '/mmcblk0p3/d' file.dts
           
-          echo "修改dts (移除 mmcblk0p3 锁定，适配 Armbian)"
-          sed -i '/mmcblk0p3/d'  file.dts
+          echo "编译回 DTB，并重命名为带有后缀的名字，方便 Armbian 使用"
+          dtc -I dts -O dtb file.dts -o rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dtb
           
-          echo "重新编译dtb"
-          dtc -I dts -O dtb file.dts -o ${{ env.DTB_NAME }}.dtb
-          
-          echo "删除未修改的dts"
-          rm -rf file.dts
+          rm -rf file.dts ${{ env.DTB_NAME }}.dtb
           
           echo "打包dtb"
           tar -zcf dtb-rockchip-${{ env.kernel_main_version }}.tar.gz  *
-          mv   dtb-rockchip-${{ env.kernel_main_version }}.tar.gz      ${{ env.armbian_path }}/
+          mv dtb-rockchip-${{ env.kernel_main_version }}.tar.gz ${{ env.armbian_path }}/
 
       - name: Prepare chroot directories
         run: |
@@ -292,32 +281,17 @@ jobs:
           cp -a ${{ env.src_path }}/System.map   ${{ env.armbian_file_path }}/System.map-${{ env.kernel_main_version }}
           cp -a ${{ env.src_path }}/.config     ${{ env.armbian_file_path }}/config-${{ env.kernel_main_version }}
           cd ${{ env.armbian_file_path }}
-          echo "查看未打包的boot文件"
-          ls  -lh
           sudo chown -R runner:runner  ${{ env.armbian_file_path }}/
-          
-          # 打包 armbian 启动文件
           tar -zcf boot-${{ env.kernel_main_version }}.tar.gz   *
-          echo "查看打包后所有文件"
-          ls -lh
 
       - name: Build  ap6212_armbian-6.16.0-boot
         run: |
           cd ${{ env.armbian_path }}/
           mv ${{ env.src_path }}/firmware/ap6212_wifi_firmware.tar.gz  .
           mv ${{ env.armbian_file_path }}/boot-${{ env.kernel_main_version }}.tar.gz   .
-          echo "查看armbian_boot下所有需要打包的文件"
-          ls -lh
-          # 包名加上标识符
           tar -zcf  armbian_boot-${{ env.kernel_main_version }}.tar.gz  *
-          echo  "查看打包后的文件是否存在"
           ls -lh
-
-      # =======================================================
-      # [修改 5] Release 上传
-      # 修改 artifacts 路径以匹配上面新的压缩包名
-      # 更新 body 描述
-      # =======================================================
+          
       - name: Upload Kernel to Release  ${{ github.event.inputs.source_tag }}
         uses: ncipollo/release-action@v1
         with:
@@ -325,19 +299,12 @@ jobs:
           name: "Hibuffx DSI Kernel ${{ env.kernel_main_version }}"
           
           artifacts: |
-            ${{ env.src_path }}/boot_files/${{ env.DTB_NAME }}-${{ env.kernel_main_version }}.tar.gz
+            ${{ env.src_path }}/boot_files/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-${{ env.kernel_main_version }}.tar.gz
             ${{ env.armbian_path }}/armbian_boot-${{ env.kernel_main_version }}.tar.gz
           body: |
             tag：  ${{ github.event.inputs.target_tag }}
             Kernel version: ${{ env.kernel_main_version }}
-            Target DTS: ${{ env.DTB_NAME }} (With DSI, Touch, Backlight support)
-            
-            1. ${{ env.DTB_NAME }}-${{ env.kernel_main_version }}.tar.gz:
-               包含 boot.img (已集成新DTS), modules, headers. 
-               使用瑞芯微工具刷入 boot.img 即可点亮屏幕。
-               
-            2. armbian_boot-${{ env.kernel_main_version }}.tar.gz:
-               用于更新 Armbian 内核的文件包 (DTB 已去除分区锁定)。
+            DTS Mode: HIBUFFX (DSI Screen enabled)
             
           draft: false
           prerelease: false
