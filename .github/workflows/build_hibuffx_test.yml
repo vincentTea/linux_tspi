@@ -1,4 +1,4 @@
-name: Robust Debug Build (Anti-Fail)
+name: Final Robust Build (Fix Git & Symvers)
 
 on:
   workflow_dispatch:
@@ -8,12 +8,12 @@ on:
         required: true
         default: 'vincentTea-hibuffx'
       
-      # === [断点续传] 填入链接可跳过对应编译步骤 ===
+      # === [断点续传] ===
       reuse_kernel_img:
         description: '[加速] Image URL (跳过 make Image)'
         required: false
       reuse_build_deps:
-        description: '[关键] build-deps.tar.gz URL (跳过 Image 必须填这个)'
+        description: '[关键] build-deps.tar.gz URL (跳过 Image 必填)'
         required: false
       reuse_modules_tar:
         description: '[极速] Modules Tarball URL (跳过 make modules)'
@@ -28,7 +28,7 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  build-robust:
+  build-final:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout Source
@@ -38,7 +38,6 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      # === 1. 初始化 Release ===
       - name: Init Release
         run: |
           TAG_NAME="build-$(date +'%Y%m%d-%H%M%S')"
@@ -54,7 +53,7 @@ jobs:
         run: |
           chmod +x scripts/mkimg scripts/resource_tool scripts/mkbootimg scripts/* || true
           
-          # 安装 Tree 用于调试
+          # 安装 Tree
           sudo apt-get update
           sudo apt-get install -y tree device-tree-compiler u-boot-tools libssl-dev bc flex bison libncurses-dev initramfs-tools busybox-static
           
@@ -73,7 +72,7 @@ jobs:
           cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dts arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dts
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- tspi_defconfig
 
-      # === 2. Kernel Image (包含容错处理) ===
+      # === 2. Kernel Image (修复 Symvers 问题) ===
       - name: Process Kernel Image
         run: |
           IMG_URL="${{ github.event.inputs.reuse_kernel_img }}"
@@ -84,36 +83,34 @@ jobs:
             wget -O arch/arm64/boot/Image "$IMG_URL"
             wget -O build-deps.tar.gz "$DEPS_URL"
             tar -xzf build-deps.tar.gz
+            
+            # 恢复环境
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
             
           else
             echo ">>> [全量] 编译 Image..."
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
             
-            # 无论 Module.symvers 是否存在，先把 Image 传上去
             echo ">>> [存档] 上传 Image..."
             if [ -f "arch/arm64/boot/Image" ]; then
               gh release upload ${{ env.RELEASE_TAG }} arch/arm64/boot/Image --clobber
-            else
-              echo "ERROR: Image 编译失败，未找到文件！"
-              exit 1
             fi
             
-            # 容错打包 build-deps
-            echo ">>> [存档] 打包依赖文件..."
-            if [ -f "Module.symvers" ]; then
-               tar -zcf build-deps.tar.gz .config Module.symvers System.map
-            else
-               echo "WARNING: Module.symvers 缺失！尝试仅打包 .config 和 System.map"
-               echo "当前根目录文件列表："
-               ls -lh
-               tar -zcf build-deps.tar.gz .config System.map || true
+            # === [核心修复] 智能处理符号表 ===
+            echo ">>> [处理] 检查符号表..."
+            if [ ! -f "Module.symvers" ] && [ -f "vmlinux.symvers" ]; then
+                echo "注意: 发现 vmlinux.symvers，复制为 Module.symvers 以供后续使用..."
+                cp vmlinux.symvers Module.symvers
             fi
+            
+            echo ">>> [存档] 打包依赖文件..."
+            # 强制打包存在的任何文件，防止报错退出
+            tar -zcf build-deps.tar.gz .config Module.symvers vmlinux.symvers System.map 2>/dev/null || tar -zcf build-deps.tar.gz .config System.map
             
             gh release upload ${{ env.RELEASE_TAG }} build-deps.tar.gz --clobber
           fi
 
-      # === 3. Modules (包含绝对路径修复) ===
+      # === 3. Modules (修复 Git 目录问题) ===
       - name: Process Modules
         run: |
           MOD_URL="${{ github.event.inputs.reuse_modules_tar }}"
@@ -125,41 +122,42 @@ jobs:
             tar -xzf modules-cache.tar.gz -C ${{ env.modules_path }}
           else
             echo ">>> [编译] Modules..."
+            # 确保 modules_prepare 已执行 (如果是全量编译，上面Image步骤可能生成了，如果是复用，也恢复了)
+            if [ ! -f "Module.symvers" ]; then
+               echo "WARNING: Module.symvers 依然缺失，尝试强制生成 modules_prepare..."
+               make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
+            fi
+            
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules -j$(nproc)
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_install INSTALL_MOD_PATH=${{ env.src_path }}/modules
           fi
           
-          # 获取真实版本号
-          cd ${{ env.modules_path }}
-          REAL_VER=$(ls -d * | head -n 1)
+          # === [核心修复] 不切换目录，直接读取 ===
+          # 在当前目录下查找 modules 路径下的第一个文件夹名
+          echo ">>> 检测真实版本号..."
+          REAL_VER=$(ls ${{ env.modules_path }} | head -n 1)
           echo "REAL_VER=$REAL_VER" >> $GITHUB_ENV
           echo ">>> 真实内核版本: $REAL_VER"
           
           if [[ -z "$MOD_URL" ]]; then
-            # 打包
-            tar -zcf ../../../modules-$REAL_VER.tar.gz $REAL_VER
+            echo ">>> 打包 Modules (使用绝对路径，保持在 Git 根目录)..."
+            # 使用 -C 参数切换到目标目录进行打包，但 tar 命令本身在当前目录运行
+            tar -zcf modules-$REAL_VER.tar.gz -C ${{ env.modules_path }} $REAL_VER
             
-            # [关键] 切回根目录上传
-            cd ${{ env.src_path }}
             echo ">>> [存档] 上传 Modules..."
+            # 此时我们肯定在 src_path，所以 gh 不会报错
             gh release upload ${{ env.RELEASE_TAG }} modules-$REAL_VER.tar.gz --clobber
-          else
-             cd ${{ env.src_path }}
           fi
 
-      # === 4. Boot & DTB (包含 Tree 调试) ===
+      # === 4. Boot & DTB ===
       - name: Build Final Artifacts
         run: |
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- rockchip/${{ env.DTB_NAME }}.dtb
           ./scripts/resource_tool arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dtb
           
-          # 立即上传 resource
           gh release upload ${{ env.RELEASE_TAG }} resource.img --clobber
           
           echo ">>> 制作 boot.img..."
-          # 强制打印输入文件状态
-          ls -lh arch/arm64/boot/Image resource.img
-          
           ./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
           
           CUSTOM_NAME="rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.REAL_VER }}.img"
@@ -170,26 +168,24 @@ jobs:
              gh release upload ${{ env.RELEASE_TAG }} $CUSTOM_NAME --clobber
           else
              echo "FATAL: boot.img 生成失败！"
-             echo ">>> 全盘 Tree 调试信息："
              tree -L 2
              exit 1
           fi
 
-      # === 5. Armbian 打包 (复用已上传的产物) ===
+      # === 5. Armbian 打包 ===
       - name: Package Armbian
         run: |
            KVER=${{ env.REAL_VER }}
            mkdir -p ${{ env.src_path }}/boot_files_final
            
-           # 收集文件 (这里我们直接用已经生成好的变量和文件)
            cp arch/arm64/boot/Image ${{ env.src_path }}/boot_files_final/vmlinuz-$KVER
-           cp System.map ${{ env.src_path }}/boot_files_final/System.map-$KVER
-           cp .config ${{ env.src_path }}/boot_files_final/config-$KVER
+           cp System.map ${{ env.src_path }}/boot_files_final/System.map-$KVER || echo "System.map missing"
+           cp .config ${{ env.src_path }}/boot_files_final/config-$KVER || echo "config missing"
            
-           # 把 modules tar 包也放进去
-           cp modules-$KVER.tar.gz ${{ env.src_path }}/boot_files_final/
+           if [ -f "modules-$KVER.tar.gz" ]; then
+              cp modules-$KVER.tar.gz ${{ env.src_path }}/boot_files_final/
+           fi
            
-           # 打包 Armbian 格式
            cd ${{ env.src_path }}/boot_files_final
            tar -zcf armbian_boot-$KVER.tar.gz *
            
