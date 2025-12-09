@@ -92,33 +92,36 @@ jobs:
           mkdir -p  ${{ env.armbian_path }}/
           mkdir -p  ${{ env.armbian_file_path }}
           
-          # 1. 覆盖 DTS：用 hibuffx dts 覆盖原厂 dts
+          # 1. 覆盖 DTS
           echo "Overwriting standard DTS with custom Hibuffx DTS..."
           cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dts arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dts
 
           # 2. 配置
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  tspi_defconfig
           
-          # 3. 编译内核 Image (多线程)
+          # 3. 编译内核 Image
           echo "Compiling Kernel Image..."
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
           
-          # 4. 编译 DTB
+          # 【新增】4. 编译内核模块 (这是缺失的一步)
+          echo "Compiling Kernel Modules..."
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules -j$(nproc)
+          
+          # 5. 编译 DTB
           echo "Compiling DTB..."
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- rockchip/${{ env.DTB_NAME }}.dtb
           
-          # 5. 手动打包 boot.img (绕过 Makefile 错误)
+          # 6. 手动打包 boot.img
           echo "Generating resource.img..."
           ./scripts/resource_tool arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dtb
           
           echo "Packing boot.img..."
-          # --kernel: 内核文件, --second: 资源文件(包含dtb和logo)
           ./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
           
-          # 6. 安装模块
+          # 7. 安装模块 (现在不会报错了，因为第4步生成了 modules.order)
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  modules_install  INSTALL_MOD_PATH=${{ env.src_path }}/modules
           
-          # 7. 检查与重命名
+          # 8. 检查与重命名
           echo "Checking boot.img..."
           ls -lh boot.img
           
@@ -126,7 +129,7 @@ jobs:
           mv boot.img  rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.kernel_main_version }}.img
           ls  -lh      rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.kernel_main_version }}.img          
           
-          # 8. 打包模块
+          # 9. 打包模块
           cd  ${{ env.modules_path }}
           tar -zcf ${{ env.kernel_main_version }}-modules.tar.gz   ${{ env.kernel_main_version }}
 
