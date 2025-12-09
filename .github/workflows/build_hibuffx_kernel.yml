@@ -1,0 +1,343 @@
+name: Build ap6212-6.16.0-rk3566-tspi-hibuffx.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: 'Source tag to build from'
+        required: true
+        default: 'tspi_ap6212_v6.16.0'
+
+env:
+  ARCH: arm64
+  src_path: /home/runner/work/linux/linux
+  modules_path: /home/runner/work/linux/linux/modules/lib/modules
+  # =======================================================
+  # [修改 1] 定义你的目标设备树名称 (不带 .dts/.dtb 后缀)
+  # =======================================================
+  DTB_NAME: rk3566-lckfb-tspi-hibuffx
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_tag }}
+          submodules: true
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fix Script Permissions
+        run: |
+          find . -type f -name "*.sh" -exec chmod +x {} \;
+          find . -type f -name "mkimg" -exec chmod +x {} \;
+          find . -type f -name "resource_tool" -exec chmod +x {} \;
+          find . -type f -name "mkbootimg" -exec chmod +x {} \;
+          chmod +x ./scripts/*
+
+      - name: Install Latest LZ4
+        run: |
+          LZ4_LATEST=$(curl -s https://api.github.com/repos/lz4/lz4/releases/latest | grep 'tarball_url' | cut -d\" -f4)
+          wget $LZ4_LATEST -O lz4-latest.tar.gz
+          tar -xzf lz4-latest.tar.gz
+          cd lz4-lz4-*
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+          lz4 --version
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            device-tree-compiler \
+            u-boot-tools \
+            libssl-dev \
+            bc \
+            flex \
+            bison \
+            libncurses-dev \
+            initramfs-tools \
+            busybox-static
+          sudo -E apt-get -y install $(curl -fsSL https://tinyurl.com/ubuntu2204-build-armbian)
+
+      - name: Setup ARM Toolchain
+        run: |
+          wget https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
+          tar xf arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
+          echo "$(pwd)/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin" >> $GITHUB_PATH
+
+      - name: Get Kernel Version
+        run: |
+          echo "kernel_main_version=$(make kernelversion)" >> $GITHUB_ENV
+
+      - name: Set armbian_path
+        run: |
+          echo "armbian_path=${{ env.src_path }}/armbian_boot" >> $GITHUB_ENV
+          echo "dtb_path=${{ env.src_path }}/dtbs" >> $GITHUB_ENV
+          echo "armbian_file_path=${{ env.src_path }}/armbian_boot_files" >> $GITHUB_ENV
+
+      # =======================================================
+      # [修改 2] 编译内核步骤
+      # 将写死的 rk3566-lckfb-tspi.img 替换为 ${{ env.DTB_NAME }}.img
+      # 重命名部分也同步修改，以便区分输出文件
+      # =======================================================
+      - name: Build Kernel
+        run: |
+          mkdir -p  ${{ env.armbian_path }}/
+          mkdir -p  ${{ env.armbian_file_path }}
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  tspi_defconfig
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- dtbs
+          
+          # 编译指定的 img (Rockchip Makefile 规则通常支持 xxx.img 对应 xxx.dts)
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  ${{ env.DTB_NAME }}.img  -j$(nproc)
+          
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  modules_install  INSTALL_MOD_PATH=${{ env.src_path }}/modules
+          echo "${{ env.kernel_main_version }}"
+          echo  "查看编译好的boot.img"
+          ls -lh boot.img
+          
+          # 重命名时带上 hibuffx 标识
+          echo "重命名boot.img为${{ env.DTB_NAME }}-boot-${{ env.kernel_main_version }}.img"
+          mv boot.img  ${{ env.DTB_NAME }}-boot-${{ env.kernel_main_version }}.img
+          ls  -lh      ${{ env.DTB_NAME }}-boot-${{ env.kernel_main_version }}.img          
+          
+          echo "当前所在编译路径：$(pwd)"
+          # 打包模块
+          cd  ${{ env.modules_path }}
+          echo "进入modules路径：${{ env.modules_path }}"
+          echo  "查看modules"
+          ls
+          echo "${{ env.kernel_main_version }}"
+          echo "查看模块详情"
+          ls -lh ${{ env.kernel_main_version }}
+          echo "打包modules"
+          tar -zcf ${{ env.kernel_main_version }}-modules.tar.gz   ${{ env.kernel_main_version }}
+          echo "查看打包的modules.tar.gz"
+          ls  -lh
+
+      - name: tar ap6212_wifi_firmware
+        run: |
+          cd ${{ env.src_path }}/firmware
+          tar -zcf ap6212_wifi_firmware.tar.gz  *
+
+      - name: Build Kernel-headers
+        run: |
+          mkdir  ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}
+          cp -a  Module.symvers      ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/
+          cp -a  Makefile           ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/
+          cp -a  scripts            ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/
+          mkdir -p                   ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/arch/arm64
+          cp -a arch/arm64/include    ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/arch/arm64/include
+          cp -a arch/arm64/kvm          ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/arch/arm64/kvm 
+          cp -a arch/arm64/Makefile      ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/arch/arm64/Makefile
+          cp -a include                  ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/
+          cp -a .config                 ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/
+          cd ${{ env.src_path }}
+          tar -zcf  ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}.tar.gz   linux-headers-${{ env.kernel_main_version }}
+          echo "当前所在路径：$(pwd)"
+          echo "查看打包的linux-headers-${{ env.kernel_main_version }}.tar.gz"
+          ls  -lh ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}.tar.gz
+
+      # =======================================================
+      # [修改 3] 打包文件步骤
+      # 引用上面重命名后的 boot 镜像文件名
+      # 修改最终压缩包名称，增加 hibuffx 标识
+      # =======================================================
+      - name: Compression_boot_files
+        run: |
+          mkdir ${{ env.src_path }}/boot_files
+          cd ${{ env.src_path }}/boot_files
+          mv ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}.tar.gz  .
+          mv ${{ env.modules_path }}/${{ env.kernel_main_version }}-modules.tar.gz   .
+          
+          # 移动新的 img 文件
+          mv ${{ env.src_path }}/${{ env.DTB_NAME }}-boot-${{ env.kernel_main_version }}.img  .
+          
+          cp -a ${{ env.src_path }}/firmware/ap6212_wifi_firmware.tar.gz  .
+          
+          # 最终包名改为 hibuffx
+          tar -zcvf ${{ env.DTB_NAME }}-${{ env.kernel_main_version }}.tar.gz   *
+
+      - name: create  armbian_modules
+        run: |
+          cd ${{ env.modules_path }}
+          tar -zcf modules-${{ env.kernel_main_version }}.tar.gz   ${{ env.kernel_main_version }}
+          mv  modules-${{ env.kernel_main_version }}.tar.gz  ${{ env.armbian_path }}/
+
+      - name: create armbian_headers
+        run: |
+          cd ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}/
+          tar -zcf  ${{ env.armbian_path }}/headers-${{ env.kernel_main_version }}.tar.gz   .
+
+      # =======================================================
+      # [修改 4] 修改 Armbian DTB 逻辑
+      # 将原来的 rk3566-lckfb-tspi.dtb 替换为 ${{ env.DTB_NAME }}.dtb
+      # 这一步非常重要，否则 Armbian 包里的 dtb 还是旧的
+      # =======================================================
+      - name: edit armbian_dtb
+        run: | 
+          mkdir -p ${{ env.dtb_path }}/dtb/rockchip
+          echo "查看未修改前的dtb"
+          ls -lh  ${{ env.src_path }}/arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dtb
+          
+          echo "复制dtb到armbian_boot路径"
+          # 复制所有 dtb 保持兼容，但后续逻辑只处理我们关注的那个
+          cp -a   ${{ env.src_path }}/arch/arm64/boot/dts/rockchip/*.dtb   ${{ env.dtb_path }}/dtb/rockchip
+          cd ${{ env.dtb_path }}/dtb/rockchip
+          
+          echo  "反编译"
+          dtc -I dtb -O dts  ${{ env.DTB_NAME }}.dtb  -o file.dts
+          
+          echo "删除未修改的dtb"
+          rm -rf ${{ env.DTB_NAME }}.dtb
+          
+          echo "修改dts (移除 mmcblk0p3 锁定，适配 Armbian)"
+          sed -i '/mmcblk0p3/d'  file.dts
+          
+          echo "重新编译dtb"
+          dtc -I dts -O dtb file.dts -o ${{ env.DTB_NAME }}.dtb
+          
+          echo "删除未修改的dts"
+          rm -rf file.dts
+          
+          echo "打包dtb"
+          tar -zcf dtb-rockchip-${{ env.kernel_main_version }}.tar.gz  *
+          mv   dtb-rockchip-${{ env.kernel_main_version }}.tar.gz      ${{ env.armbian_path }}/
+
+      - name: Prepare chroot directories
+        run: |
+          sudo mkdir -p /mnt/chroot/lib/modules
+          sudo mkdir -p /mnt/chroot/usr/src
+          sudo cp -a ${{ env.modules_path }}/${{ env.kernel_main_version }} /mnt/chroot/lib/modules/
+          sudo cp -a ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}   /mnt/chroot/usr/src/
+
+      - name: Install chroot dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap qemu-user-static initramfs-tools u-boot-tools
+
+      - name: Setup  chroot base system
+        run: |
+          sudo debootstrap --arch=arm64 --variant=minbase jammy /mnt/chroot http://ports.ubuntu.com/
+          sudo cp /usr/bin/qemu-aarch64-static /mnt/chroot/usr/bin/
+          sudo cp /etc/resolv.conf /mnt/chroot/etc/
+          sudo mount -t proc proc /mnt/chroot/proc
+          sudo mount -t sysfs sys /mnt/chroot/sys
+          sudo mount -o bind /dev /mnt/chroot/dev
+
+      - name: Pre-configure chroot environment
+        run: |
+          sudo chroot /mnt/chroot /bin/bash <<'PREEOF'
+          echo "deb http://ports.ubuntu.com/ubuntu-ports jammy main universe multiverse" > /etc/apt/sources.list
+          echo "deb http://ports.ubuntu.com/ubuntu-ports jammy-updates main universe multiverse" >> /etc/apt/sources.list
+          echo "deb http://ports.ubuntu.com/ubuntu-ports jammy-security main universe multiverse" >> /etc/apt/sources.list
+          apt-get update -y
+          PREEOF
+
+      - name: Build initrd in chroot
+        run: |
+          sudo chroot /mnt/chroot /bin/bash <<'EOF'
+          apt-get install -y --no-install-recommends \
+            locales \
+            dialog \
+            apt-utils \
+            initramfs-tools \
+            u-boot-tools \
+            busybox-static \
+            kmod \
+            linux-base
+
+          echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+          /usr/sbin/locale-gen en_US.UTF-8
+          mkdir -p /boot
+          
+          echo "正在生成 initrd.img-${{ env.kernel_main_version }}"
+          [[ -f "/etc/initramfs-tools/update-initramfs.conf" ]] && sed -i "s|^update_initramfs=.*|update_initramfs=no|g" /etc/initramfs-tools/update-initramfs.conf
+          [[ -f "/etc/initramfs-tools/initramfs.conf" ]] && sed -i "s|^COMPRESS=.*|COMPRESS=gzip|g"   /etc/initramfs-tools/initramfs.conf
+          update-initramfs -c -k  ${{ env.kernel_main_version }}
+          
+          echo "正在生成 uInitrd-${{ env.kernel_main_version }}"
+          if ! /usr/bin/mkimage -A arm64 -O linux -T ramdisk -C gzip -a 0 -e 0 -n uInitrd \
+            -d /boot/initrd.img-${{ env.kernel_main_version }} /boot/uInitrd-${{ env.kernel_main_version }}; then
+            echo "mkimage 执行失败，尝试重新安装 u-boot-tools..."
+            apt-get install -y --reinstall u-boot-tools
+            /usr/bin/mkimage -A arm64 -O linux -T ramdisk -C gzip -a 0 -e 0 -n uInitrd \
+              -d /boot/initrd.img-${{ env.kernel_main_version }} /boot/uInitrd-${{ env.kernel_main_version }}
+          fi
+          ls -lh /boot/initrd.img-${{ env.kernel_main_version }} /boot/uInitrd-${{ env.kernel_main_version }}
+          EOF
+
+      - name: copy initrd.img  uInitrd
+        run: |
+          sudo cp /mnt/chroot/boot/initrd.img-${{ env.kernel_main_version }}   ${{ env.armbian_file_path }}/
+          sudo cp /mnt/chroot/boot/uInitrd-${{ env.kernel_main_version }}       ${{ env.armbian_file_path }}/
+          echo "复制出来的initrd.img、uInitrd"
+          ls -lh ${{ env.armbian_file_path }} 
+
+      - name: Clean chroot
+        run: |
+          sudo umount /mnt/chroot/dev
+          sudo umount /mnt/chroot/proc
+          sudo umount /mnt/chroot/sys
+          sudo rm -rf /mnt/chroot
+
+      - name: cp armbian_boot_file
+        run: |
+          cp -a ${{ env.src_path }}/arch/arm64/boot/Image   ${{ env.armbian_file_path }}/vmlinuz-${{ env.kernel_main_version }}
+          cp -a ${{ env.src_path }}/System.map   ${{ env.armbian_file_path }}/System.map-${{ env.kernel_main_version }}
+          cp -a ${{ env.src_path }}/.config     ${{ env.armbian_file_path }}/config-${{ env.kernel_main_version }}
+          cd ${{ env.armbian_file_path }}
+          echo "查看未打包的boot文件"
+          ls  -lh
+          sudo chown -R runner:runner  ${{ env.armbian_file_path }}/
+          
+          # 打包 armbian 启动文件
+          tar -zcf boot-${{ env.kernel_main_version }}.tar.gz   *
+          echo "查看打包后所有文件"
+          ls -lh
+
+      - name: Build  ap6212_armbian-6.16.0-boot
+        run: |
+          cd ${{ env.armbian_path }}/
+          mv ${{ env.src_path }}/firmware/ap6212_wifi_firmware.tar.gz  .
+          mv ${{ env.armbian_file_path }}/boot-${{ env.kernel_main_version }}.tar.gz   .
+          echo "查看armbian_boot下所有需要打包的文件"
+          ls -lh
+          # 包名加上标识符
+          tar -zcf  armbian_boot-${{ env.kernel_main_version }}.tar.gz  *
+          echo  "查看打包后的文件是否存在"
+          ls -lh
+
+      # =======================================================
+      # [修改 5] Release 上传
+      # 修改 artifacts 路径以匹配上面新的压缩包名
+      # 更新 body 描述
+      # =======================================================
+      - name: Upload Kernel to Release  ${{ github.event.inputs.source_tag }}
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.event.inputs.target_tag }}
+          name: "Hibuffx DSI Kernel ${{ env.kernel_main_version }}"
+          
+          artifacts: |
+            ${{ env.src_path }}/boot_files/${{ env.DTB_NAME }}-${{ env.kernel_main_version }}.tar.gz
+            ${{ env.armbian_path }}/armbian_boot-${{ env.kernel_main_version }}.tar.gz
+          body: |
+            tag：  ${{ github.event.inputs.target_tag }}
+            Kernel version: ${{ env.kernel_main_version }}
+            Target DTS: ${{ env.DTB_NAME }} (With DSI, Touch, Backlight support)
+            
+            1. ${{ env.DTB_NAME }}-${{ env.kernel_main_version }}.tar.gz:
+               包含 boot.img (已集成新DTS), modules, headers. 
+               使用瑞芯微工具刷入 boot.img 即可点亮屏幕。
+               
+            2. armbian_boot-${{ env.kernel_main_version }}.tar.gz:
+               用于更新 Armbian 内核的文件包 (DTB 已去除分区锁定)。
+            
+          draft: false
+          prerelease: false
+          allowUpdates: true
+          replaceArtifacts: false
