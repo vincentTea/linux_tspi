@@ -196,15 +196,13 @@
 };
 
 &hdmi {
-	avdd-0v9-supply = <&vdda0v9_image>;
-	avdd-1v8-supply = <&vcca1v8_image>;
-	status = "okay";
+	status = "disabled";
 };
 
 &hdmi_in {
-	hdmi_in_vp0: endpoint {
-		remote-endpoint = <&vp0_out_hdmi>;
-	};
+	status = "disabled";
+	/* 关键指令：删除 remote-endpoint 属性，防止它去找 vp0_out_hdmi */
+	/delete-property/ remote-endpoint;
 };
 
 &hdmi_out {
