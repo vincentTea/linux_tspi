@@ -766,6 +766,8 @@
 
 &dsi1 {
 	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
 	dsi1_panel: panel@0 {
 		status = "okay";
 		compatible = "simple-panel-dsi";
