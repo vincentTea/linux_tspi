@@ -13,11 +13,11 @@ env:
   src_path: /home/runner/work/linux/linux
   modules_path: /home/runner/work/linux/linux/modules/lib/modules
   # =======================================================
-  # [修改 1] 改回【原厂标准名称】，骗过 Rockchip 的打包脚本
-  # =======================================================
+  # 定义原厂标准名称 (用于欺骗构建脚本)
   DTB_NAME: rk3566-lckfb-tspi
-  # 定义一个变量用于最终文件重命名，方便区分
+  # 定义自定义后缀 (用于最终文件命名)
   CUSTOM_SUFFIX: hibuffx
+  # =======================================================
 
 jobs:
   build:
@@ -82,39 +82,51 @@ jobs:
           echo "armbian_file_path=${{ env.src_path }}/armbian_boot_files" >> $GITHUB_ENV
 
       # =======================================================
-      # [修改 2] 偷梁换柱编译法
-      # 1. 用 hibuffx.dts 覆盖 原厂.dts
-      # 2. 用原厂名字编译（解决 Syntax error）
-      # 3. 输出改名
+      # [核心修改] 手动编译与打包
+      # 1. 覆盖 DTS
+      # 2. 分别编译 Image 和 DTB
+      # 3. 手动调用 mkbootimg (避开 Makefile 报错)
       # =======================================================
       - name: Build Kernel
         run: |
           mkdir -p  ${{ env.armbian_path }}/
           mkdir -p  ${{ env.armbian_file_path }}
           
-          # 【关键步骤】覆盖文件：用你的配置覆盖原厂文件
+          # 1. 覆盖 DTS：用 hibuffx dts 覆盖原厂 dts
           echo "Overwriting standard DTS with custom Hibuffx DTS..."
           cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dts arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dts
 
+          # 2. 配置
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  tspi_defconfig
           
-          # 编译 dtb (使用标准名称)
+          # 3. 编译内核 Image (多线程)
+          echo "Compiling Kernel Image..."
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
+          
+          # 4. 编译 DTB
+          echo "Compiling DTB..."
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- rockchip/${{ env.DTB_NAME }}.dtb
           
-          # 编译 img (使用标准名称，这下不会报错了)
-          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  ${{ env.DTB_NAME }}.img  -j$(nproc)
-                    
+          # 5. 手动打包 boot.img (绕过 Makefile 错误)
+          echo "Generating resource.img..."
+          ./scripts/resource_tool arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dtb
+          
+          echo "Packing boot.img..."
+          # --kernel: 内核文件, --second: 资源文件(包含dtb和logo)
+          ./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
+          
+          # 6. 安装模块
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  modules_install  INSTALL_MOD_PATH=${{ env.src_path }}/modules
           
-          echo "查看编译好的boot.img"
+          # 7. 检查与重命名
+          echo "Checking boot.img..."
           ls -lh boot.img
           
-          # 【重命名】加上你的后缀，方便区分
-          echo "重命名boot.img"
+          echo "Renaming boot.img..."
           mv boot.img  rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.kernel_main_version }}.img
           ls  -lh      rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.kernel_main_version }}.img          
           
-          # 打包模块
+          # 8. 打包模块
           cd  ${{ env.modules_path }}
           tar -zcf ${{ env.kernel_main_version }}-modules.tar.gz   ${{ env.kernel_main_version }}
 
@@ -138,10 +150,6 @@ jobs:
           cd ${{ env.src_path }}
           tar -zcf  ${{ env.src_path }}/linux-headers-${{ env.kernel_main_version }}.tar.gz   linux-headers-${{ env.kernel_main_version }}
 
-      # =======================================================
-      # [修改 3] 打包文件调整
-      # 适配上面的重命名逻辑
-      # =======================================================
       - name: Compression_boot_files
         run: |
           mkdir ${{ env.src_path }}/boot_files
@@ -154,7 +162,7 @@ jobs:
           
           cp -a ${{ env.src_path }}/firmware/ap6212_wifi_firmware.tar.gz  .
           
-          # 压缩包名
+          # 压缩包
           tar -zcvf rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-${{ env.kernel_main_version }}.tar.gz   *
 
       - name: create  armbian_modules
@@ -169,32 +177,31 @@ jobs:
           tar -zcf  ${{ env.armbian_path }}/headers-${{ env.kernel_main_version }}.tar.gz   .
 
       # =======================================================
-      # [修改 4] Armbian DTB 逻辑调整
-      # 这里处理的是【标准名称】的 DTB (因为我们覆盖了)
-      # 但最终打包出去改个名
+      # [修改] Armbian DTB 逻辑
+      # 确保复制和处理的是我们覆盖后的 DTB
       # =======================================================
       - name: edit armbian_dtb
         run: | 
           mkdir -p ${{ env.dtb_path }}/dtb/rockchip
           
-          # 这里只能找到标准名称的 dtb (因为 Makefile 生成的就是这个)
+          # 复制编译好的标准名称 DTB (内容其实是 hibuffx)
           echo "复制dtb: ${{ env.DTB_NAME }}.dtb"
           cp -a ${{ env.src_path }}/arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dtb ${{ env.dtb_path }}/dtb/rockchip/
           
           cd ${{ env.dtb_path }}/dtb/rockchip
           
-          echo "反编译标准名称 DTB"
+          echo "反编译 DTB"
           dtc -I dtb -O dts ${{ env.DTB_NAME }}.dtb -o file.dts
           
-          echo "修改dts (移除 mmcblk0p3 锁定)"
+          echo "移除 mmcblk0p3 锁定"
           sed -i '/mmcblk0p3/d' file.dts
           
-          echo "编译回 DTB，并重命名为带有后缀的名字，方便 Armbian 使用"
+          echo "编译回 DTB 并重命名为 hibuffx 后缀"
           dtc -I dts -O dtb file.dts -o rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dtb
           
           rm -rf file.dts ${{ env.DTB_NAME }}.dtb
           
-          echo "打包dtb"
+          echo "打包 Armbian DTB"
           tar -zcf dtb-rockchip-${{ env.kernel_main_version }}.tar.gz  *
           mv dtb-rockchip-${{ env.kernel_main_version }}.tar.gz ${{ env.armbian_path }}/
 
