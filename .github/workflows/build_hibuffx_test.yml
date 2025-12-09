@@ -1,0 +1,199 @@
+name: Debug Build ap6212-6.16.0 (Paranoid Logging)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: 'Source tag (Git tag/branch)'
+        required: true
+        default: 'vincentTea-hibuffx'
+      # === 下面这两个框，第一次留空。第二次调试时，填入 Release 中的链接即可跳过编译 ===
+      reuse_kernel_img:
+        description: '[加速] Kernel Image 下载链接 (跳过 make Image)'
+        required: false
+      reuse_modules_tar:
+        description: '[加速] Modules Tarball 下载链接 (跳过 make modules)'
+        required: false
+
+env:
+  ARCH: arm64
+  src_path: /home/runner/work/linux/linux
+  modules_path: /home/runner/work/linux/linux/modules/lib/modules
+  DTB_NAME: rk3566-lckfb-tspi
+  CUSTOM_SUFFIX: hibuffx
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  debug-build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_tag }}
+          submodules: true
+          fetch-depth: 0
+
+      # === 1. 开局直接创建 Release，用于实时上传产物 ===
+      - name: Create Debug Release
+        id: create_release
+        run: |
+          TAG_NAME="debug-$(date +'%Y%m%d-%H%M%S')"
+          echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
+          
+          echo ">>> 创建 Release: $TAG_NAME"
+          gh release create "$TAG_NAME" \
+            --title "Debug: $TAG_NAME" \
+            --notes "调试构建。产物会在构建过程中逐步上传。" \
+            --draft=false \
+            --prerelease=true
+
+      - name: Setup Environment & Tools
+        run: |
+          # 修复脚本权限
+          chmod +x scripts/mkimg scripts/resource_tool scripts/mkbootimg scripts/* || true
+          
+          # 安装 LZ4
+          LZ4_URL=$(curl -s https://api.github.com/repos/lz4/lz4/releases/latest | grep 'tarball_url' | cut -d\" -f4)
+          wget $LZ4_URL -O lz4.tar.gz && tar -xzf lz4.tar.gz && cd lz4-lz4-* && make -j$(nproc) && sudo make install && sudo ldconfig
+          
+          # 安装依赖
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler u-boot-tools libssl-dev bc flex bison libncurses-dev initramfs-tools busybox-static
+          
+          # 安装 ARM 工具链
+          wget https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
+          tar xf arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
+          echo "$(pwd)/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin" >> $GITHUB_PATH
+
+      - name: Configure Kernel
+        run: |
+          mkdir -p ${{ env.src_path }}/modules
+          
+          echo ">>> 覆盖 DTS..."
+          cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dts arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dts
+          
+          echo ">>> 生成 .config"
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- tspi_defconfig
+          
+          # 记录基础版本号
+          BASE_VER=$(make kernelversion)
+          echo "kernel_base_version=$BASE_VER" >> $GITHUB_ENV
+
+      # === 2. Kernel Image (复用或编译) ===
+      - name: Process Kernel Image
+        run: |
+          URL="${{ github.event.inputs.reuse_kernel_img }}"
+          if [[ -n "$URL" ]]; then
+            echo ">>> [跳过编译] 正在下载 Image..."
+            wget -O arch/arm64/boot/Image "$URL"
+          else
+            echo ">>> [开始编译] Kernel Image..."
+            make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
+            
+            echo ">>> [上传产物] 立即上传 Image..."
+            gh release upload ${{ env.RELEASE_TAG }} arch/arm64/boot/Image --clobber
+          fi
+          
+          # 检查文件是否存在
+          ls -lh arch/arm64/boot/Image || (echo "ERROR: Image 缺失！" && exit 1)
+
+      # === 3. Kernel Modules (复用或编译) ===
+      - name: Process Modules
+        run: |
+          URL="${{ github.event.inputs.reuse_modules_tar }}"
+          mkdir -p ${{ env.modules_path }}
+          
+          if [[ -n "$URL" ]]; then
+            echo ">>> [跳过编译] 正在下载 Modules..."
+            wget -O modules.tar.gz "$URL"
+            # 假设 tar 包结构是 6.18.0-xxx/kernel/...
+            tar -xzf modules.tar.gz -C ${{ env.modules_path }}
+          else
+            echo ">>> [开始编译] Modules..."
+            make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules -j$(nproc)
+            
+            echo ">>> 安装模块到临时目录..."
+            make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_install INSTALL_MOD_PATH=${{ env.src_path }}/modules
+          fi
+          
+          # 获取真实版本号 (Dirty Version)
+          cd ${{ env.modules_path }}
+          REAL_VER=$(ls -d * | head -n 1)
+          echo ">>> 检测到真实内核版本: $REAL_VER"
+          echo "REAL_VER=$REAL_VER" >> $GITHUB_ENV
+          
+          # 如果是新编译的，打包上传
+          if [[ -z "$URL" ]]; then
+            echo ">>> 打包上传 Modules..."
+            tar -zcf ../../../modules-$REAL_VER.tar.gz $REAL_VER
+            gh release upload ${{ env.RELEASE_TAG }} ../../../modules-$REAL_VER.tar.gz --clobber
+          fi
+
+      # === 4. DTB & Resource (必须重新生成以确保匹配) ===
+      - name: Build DTB & Resource
+        run: |
+          echo ">>> 编译 DTB..."
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- rockchip/${{ env.DTB_NAME }}.dtb
+          
+          echo ">>> 生成 resource.img..."
+          ./scripts/resource_tool arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dtb
+          
+          echo ">>> 检查 resource.img..."
+          ls -lh resource.img
+          
+          echo ">>> 上传 resource.img..."
+          gh release upload ${{ env.RELEASE_TAG }} resource.img --clobber
+
+      # === 5. [关键调试点] 制作 boot.img ===
+      - name: Make Boot Image (Debug Mode)
+        run: |
+          echo ">>> 准备制作 boot.img..."
+          echo "当前目录文件情况 (ls -lh):"
+          ls -lh
+          
+          echo "检查 mkbootimg 脚本是否存在:"
+          ls -lh scripts/mkbootimg
+          
+          echo "检查输入文件:"
+          ls -lh arch/arm64/boot/Image
+          ls -lh resource.img
+          
+          echo ">>> 执行 mkbootimg 命令..."
+          # 强制打印输出，并不允许失败
+          ./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
+          EXIT_CODE=$?
+          
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "ERROR: mkbootimg 执行失败，返回码: $EXIT_CODE"
+            exit 1
+          fi
+          
+          echo ">>> 命令执行结束，检查 boot.img 是否存在..."
+          if [ -f "boot.img" ]; then
+            echo "SUCCESS: boot.img 生成成功！"
+            ls -lh boot.img
+            
+            echo ">>> 立即上传 boot.img (原始名)..."
+            gh release upload ${{ env.RELEASE_TAG }} boot.img --clobber
+          else
+            echo "FATAL: boot.img 未生成！"
+            echo ">>> 全盘搜索 boot.img (可能生成到了别的地方):"
+            find . -name "boot.img"
+            exit 1
+          fi
+
+      # === 6. 重命名与最终打包 (此时文件肯定存在) ===
+      - name: Final Packaging
+        run: |
+          REAL_VER=${{ env.REAL_VER }}
+          CUSTOM_NAME="rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-$REAL_VER.img"
+          
+          echo ">>> 重命名 boot.img -> $CUSTOM_NAME"
+          mv boot.img $CUSTOM_NAME
+          
+          echo ">>> 上传最终更名后的 boot.img..."
+          gh release upload ${{ env.RELEASE_TAG }} $CUSTOM_NAME --clobber
+          
+          # 这里你可以继续添加打包 Armbian 文件的逻辑
+          # 但为了调试 boot.img 丢失问题，前面的步骤已经足够定位了
