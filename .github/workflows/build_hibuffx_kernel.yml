@@ -103,7 +103,7 @@ jobs:
           echo "Compiling Kernel Image..."
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
           
-          # 【新增】4. 编译内核模块 (这是缺失的一步)
+          # 4. 编译内核模块
           echo "Compiling Kernel Modules..."
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules -j$(nproc)
           
@@ -118,20 +118,28 @@ jobs:
           echo "Packing boot.img..."
           ./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
           
-          # 7. 安装模块 (现在不会报错了，因为第4步生成了 modules.order)
+          # 7. 安装模块
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu-  modules_install  INSTALL_MOD_PATH=${{ env.src_path }}/modules
           
-          # 8. 检查与重命名
-          echo "Checking boot.img..."
-          ls -lh boot.img
+          # === [关键修复] 获取真实内核版本号(带dirty后缀) ===
+          cd ${{ env.modules_path }}
+          # 动态获取目录名 (例如 6.18.0-gxxxx-dirty)
+          REAL_VER=$(ls -d * | head -n 1)
+          echo "Detected real kernel version: $REAL_VER"
           
-          echo "Renaming boot.img..."
-          mv boot.img  rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.kernel_main_version }}.img
-          ls  -lh      rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.kernel_main_version }}.img          
+          # 更新 Github Env，让后续所有步骤(Headers/Chroot等)都使用这个真实版本号
+          echo "kernel_main_version=$REAL_VER" >> $GITHUB_ENV
           
-          # 9. 打包模块
-          cd  ${{ env.modules_path }}
-          tar -zcf ${{ env.kernel_main_version }}-modules.tar.gz   ${{ env.kernel_main_version }}
+          # 8. 重命名 boot.img (使用 Shell 变量 $REAL_VER)
+          cd ${{ env.src_path }}
+          echo "Renaming boot.img to use real version..."
+          mv boot.img  rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-$REAL_VER.img
+          ls -lh rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-$REAL_VER.img
+          
+          # 9. 打包模块 (使用 Shell 变量 $REAL_VER)
+          cd ${{ env.modules_path }}
+          echo "Tarring modules directory: $REAL_VER"
+          tar -zcf $REAL_VER-modules.tar.gz $REAL_VER
 
       - name: tar ap6212_wifi_firmware
         run: |
