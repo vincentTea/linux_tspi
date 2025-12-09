@@ -1,22 +1,22 @@
-name: Ultimate Build (Save Intermediate & Tree Debug)
+name: Robust Debug Build (Anti-Fail)
 
 on:
   workflow_dispatch:
     inputs:
       target_tag:
-        description: 'Source tag'
+        description: 'Git Tag/Branch'
         required: true
         default: 'vincentTea-hibuffx'
       
-      # === [下次调试填这里] ===
+      # === [断点续传] 填入链接可跳过对应编译步骤 ===
       reuse_kernel_img:
-        description: '[加速] Image 下载链接 (复用内核镜像)'
+        description: '[加速] Image URL (跳过 make Image)'
         required: false
       reuse_build_deps:
-        description: '[关键] build-deps.tar.gz 下载链接 (复用配置和符号表)'
+        description: '[关键] build-deps.tar.gz URL (跳过 Image 必须填这个)'
         required: false
       reuse_modules_tar:
-        description: '[极速] Modules Tarball 下载链接 (复用已编译模块)'
+        description: '[极速] Modules Tarball URL (跳过 make modules)'
         required: false
 
 env:
@@ -28,7 +28,7 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  build-and-archive:
+  build-robust:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout Source
@@ -38,24 +38,23 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      # === 1. 初始化 Release (以时间命名) ===
-      - name: Initialize Release
-        id: create_release
+      # === 1. 初始化 Release ===
+      - name: Init Release
         run: |
           TAG_NAME="build-$(date +'%Y%m%d-%H%M%S')"
           echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
           
           gh release create "$TAG_NAME" \
-            --title "Build Artifacts $TAG_NAME" \
-            --notes "包含 Image, build-deps (中间产物), modules 和最终 boot.img" \
+            --title "Build: $TAG_NAME" \
+            --notes "Debug Build Artifacts" \
             --draft=false \
             --prerelease=true
 
-      - name: Setup Environment
+      - name: Setup Env & Tools
         run: |
           chmod +x scripts/mkimg scripts/resource_tool scripts/mkbootimg scripts/* || true
           
-          # 安装 Tree 用于调试目录结构
+          # 安装 Tree 用于调试
           sudo apt-get update
           sudo apt-get install -y tree device-tree-compiler u-boot-tools libssl-dev bc flex bison libncurses-dev initramfs-tools busybox-static
           
@@ -74,97 +73,91 @@ jobs:
           cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dts arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dts
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- tspi_defconfig
 
-      # === 2. Kernel Image & 中间产物 (核心步骤) ===
+      # === 2. Kernel Image (包含容错处理) ===
       - name: Process Kernel Image
         run: |
           IMG_URL="${{ github.event.inputs.reuse_kernel_img }}"
           DEPS_URL="${{ github.event.inputs.reuse_build_deps }}"
           
           if [[ -n "$IMG_URL" ]] && [[ -n "$DEPS_URL" ]]; then
-            echo ">>> [加速模式] 下载 Image 和 中间产物..."
+            echo ">>> [加速] 下载 Image 和 依赖..."
             wget -O arch/arm64/boot/Image "$IMG_URL"
             wget -O build-deps.tar.gz "$DEPS_URL"
-            
-            echo ">>> 恢复中间产物 (.config, Module.symvers)..."
             tar -xzf build-deps.tar.gz
-            
-            echo ">>> 准备构建环境 (modules_prepare)..."
-            # 这一步是为了让后续 Modules 编译能找到符号表，防止 modpost 报错
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
             
           else
-            echo ">>> [全量编译] 开始编译 Image..."
+            echo ">>> [全量] 编译 Image..."
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
             
+            # 无论 Module.symvers 是否存在，先把 Image 传上去
             echo ">>> [存档] 上传 Image..."
-            gh release upload ${{ env.RELEASE_TAG }} arch/arm64/boot/Image --clobber
+            if [ -f "arch/arm64/boot/Image" ]; then
+              gh release upload ${{ env.RELEASE_TAG }} arch/arm64/boot/Image --clobber
+            else
+              echo "ERROR: Image 编译失败，未找到文件！"
+              exit 1
+            fi
             
-            echo ">>> [存档] 打包并上传中间产物 (build-deps)..."
-            # 这里保存了最重要的三个文件，保证下次不用重编内核也能编模块
-            tar -zcf build-deps.tar.gz .config Module.symvers System.map
+            # 容错打包 build-deps
+            echo ">>> [存档] 打包依赖文件..."
+            if [ -f "Module.symvers" ]; then
+               tar -zcf build-deps.tar.gz .config Module.symvers System.map
+            else
+               echo "WARNING: Module.symvers 缺失！尝试仅打包 .config 和 System.map"
+               echo "当前根目录文件列表："
+               ls -lh
+               tar -zcf build-deps.tar.gz .config System.map || true
+            fi
+            
             gh release upload ${{ env.RELEASE_TAG }} build-deps.tar.gz --clobber
           fi
 
-      # === 3. Modules (已修复路径问题) ===
+      # === 3. Modules (包含绝对路径修复) ===
       - name: Process Modules
         run: |
           MOD_URL="${{ github.event.inputs.reuse_modules_tar }}"
           mkdir -p ${{ env.modules_path }}
           
           if [[ -n "$MOD_URL" ]]; then
-            echo ">>> [极速模式] 下载现有 Modules..."
+            echo ">>> [极速] 下载 Modules..."
             wget -O modules-cache.tar.gz "$MOD_URL"
             tar -xzf modules-cache.tar.gz -C ${{ env.modules_path }}
-            
           else
-            echo ">>> [编译模式] 开始编译 Modules..."
+            echo ">>> [编译] Modules..."
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules -j$(nproc)
-            
-            echo ">>> 安装 Modules..."
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_install INSTALL_MOD_PATH=${{ env.src_path }}/modules
           fi
           
-          # 查找真实版本号
+          # 获取真实版本号
           cd ${{ env.modules_path }}
           REAL_VER=$(ls -d * | head -n 1)
-          
-          if [ -z "$REAL_VER" ]; then
-             echo "ERROR: 模块目录下为空，未找到版本号！"
-             cd ${{ env.src_path }}
-             echo "当前 modules 目录结构："
-             tree -L 3 modules/
-             exit 1
-          fi
-          
           echo "REAL_VER=$REAL_VER" >> $GITHUB_ENV
           echo ">>> 真实内核版本: $REAL_VER"
           
-          # 如果是新编译的，打包并上传
           if [[ -z "$MOD_URL" ]]; then
-            echo ">>> 打包 Modules..."
+            # 打包
             tar -zcf ../../../modules-$REAL_VER.tar.gz $REAL_VER
             
-            # [关键修复] 切回根目录，否则 gh 报错
+            # [关键] 切回根目录上传
             cd ${{ env.src_path }}
             echo ">>> [存档] 上传 Modules..."
             gh release upload ${{ env.RELEASE_TAG }} modules-$REAL_VER.tar.gz --clobber
           else
-            cd ${{ env.src_path }}
+             cd ${{ env.src_path }}
           fi
 
-      # === 4. 生成 DTB & Boot (带 Tree 调试) ===
+      # === 4. Boot & DTB (包含 Tree 调试) ===
       - name: Build Final Artifacts
         run: |
-          echo ">>> 编译 DTB..."
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- rockchip/${{ env.DTB_NAME }}.dtb
-          
-          echo ">>> 制作 resource.img..."
           ./scripts/resource_tool arch/arm64/boot/dts/rockchip/${{ env.DTB_NAME }}.dtb
+          
+          # 立即上传 resource
           gh release upload ${{ env.RELEASE_TAG }} resource.img --clobber
           
           echo ">>> 制作 boot.img..."
-          # 调试打印，确认输入文件存在
-          echo "[Debug] 输入文件检查："
+          # 强制打印输入文件状态
           ls -lh arch/arm64/boot/Image resource.img
           
           ./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
@@ -172,16 +165,34 @@ jobs:
           CUSTOM_NAME="rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.REAL_VER }}.img"
           
           if [ -f "boot.img" ]; then
-            echo "SUCCESS: boot.img 生成成功"
-            mv boot.img $CUSTOM_NAME
-            echo ">>> [存档] 上传最终 boot.img..."
-            gh release upload ${{ env.RELEASE_TAG }} $CUSTOM_NAME --clobber
+             mv boot.img $CUSTOM_NAME
+             echo ">>> [存档] 上传 boot.img..."
+             gh release upload ${{ env.RELEASE_TAG }} $CUSTOM_NAME --clobber
           else
-            echo "FATAL: boot.img 未生成！"
-            echo ">>> [Debug] 打印当前目录结构 (Tree):"
-            tree -L 2
-            exit 1
+             echo "FATAL: boot.img 生成失败！"
+             echo ">>> 全盘 Tree 调试信息："
+             tree -L 2
+             exit 1
           fi
 
-      - name: Finish
-        run: echo "Build cycle complete."
+      # === 5. Armbian 打包 (复用已上传的产物) ===
+      - name: Package Armbian
+        run: |
+           KVER=${{ env.REAL_VER }}
+           mkdir -p ${{ env.src_path }}/boot_files_final
+           
+           # 收集文件 (这里我们直接用已经生成好的变量和文件)
+           cp arch/arm64/boot/Image ${{ env.src_path }}/boot_files_final/vmlinuz-$KVER
+           cp System.map ${{ env.src_path }}/boot_files_final/System.map-$KVER
+           cp .config ${{ env.src_path }}/boot_files_final/config-$KVER
+           
+           # 把 modules tar 包也放进去
+           cp modules-$KVER.tar.gz ${{ env.src_path }}/boot_files_final/
+           
+           # 打包 Armbian 格式
+           cd ${{ env.src_path }}/boot_files_final
+           tar -zcf armbian_boot-$KVER.tar.gz *
+           
+           cd ${{ env.src_path }}
+           echo ">>> [存档] 上传 Armbian 包..."
+           gh release upload ${{ env.RELEASE_TAG }} boot_files_final/armbian_boot-$KVER.tar.gz --clobber
