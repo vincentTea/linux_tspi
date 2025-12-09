@@ -6,7 +6,7 @@ on:
       target_tag:
         description: 'Source tag to build from'
         required: true
-        default: 'tspi_ap6212_v6.16.0'
+        default: 'vincentTea-hibuffx'
 
 env:
   ARCH: arm64
