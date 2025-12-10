@@ -1,4 +1,4 @@
-name: Build Only DTBs (Global)
+name: Build Rockchip DTBs
 
 on:
   workflow_dispatch:
@@ -10,80 +10,76 @@ on:
 
 env:
   ARCH: arm64
-  # 您的标准文件名
-  DTB_STANDARD: rk3566-lckfb-tspi
-  # 您的自定义后缀
-  CUSTOM_SUFFIX: hibuffx
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  build-dtbs-only:
+  build-dtbs-pure:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout Source
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.target_tag }}
-          submodules: false # 编译DTB通常不需要子模块，加快速度
-          fetch-depth: 1    # 浅克隆，加快速度
+          submodules: false
+          fetch-depth: 1
 
-      - name: Create Release
+      - name: Create Release (CST/UTC+8)
         id: create_release
         run: |
-          TAG_NAME="DTB-Only-$(date +'%Y%m%d-%H%M')"
+          # === 修改：使用 TZ=Asia/Shanghai 获取中国时间 ===
+          # 获取当前北京时间
+          current_date=$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M')
+          
+          TAG_NAME="DTB-Pure-$current_date"
           echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
           
+          # 创建 Release
           gh release create "$TAG_NAME" \
-            --title "DTB Collection $TAG_NAME" \
-            --notes "Contains all compiled DTBs from arch/arm64/boot/dts/rockchip/." \
+            --title "DTB Pure Build $current_date (CST)" \
+            --notes "Contains all .dtb and .dtbo files with original folder structure. Built at $(TZ=Asia/Shanghai date)" \
             -R ${{ github.repository }}
 
       - name: Install Toolchain & Deps
         run: |
-          # 安装编译 DTB 必须的宿主工具
           sudo apt-get update
-          sudo apt-get install -y device-tree-compiler bc flex bison libssl-dev make gcc
+          sudo apt-get install -y device-tree-compiler make gcc bc
           
-          # 下载并配置交叉编译链 (GCC 14.2)
+          # 下载 GCC 14.2 交叉编译链
           wget -q https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
           tar xf arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
           echo "$(pwd)/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin" >> $GITHUB_PATH
 
-      - name: Configure & Overwrite DTS
+      - name: Generate Config
         run: |
-          # 1. 执行您的覆盖策略（将 hibuffx 伪装成 standard）
-          #    这样全局编译时，rk3566-lckfb-tspi.dtb 实际上就是您的 hibuffx 配置
-          echo ">>> Overwriting Standard DTS with Hibuffx source..."
-          cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dts \
-             arch/arm64/boot/dts/rockchip/${{ env.DTB_STANDARD }}.dts
-          
-          # 2. 生成基础配置 (编译 DTB 前必须先生成 .config)
-          #    这里使用 tspi_defconfig，确保宏定义正确
-          echo ">>> Generating config..."
+          # 生成基础配置
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- tspi_defconfig
 
-      - name: Make All DTBs
+      - name: Compile All DTBs
         run: |
-          echo ">>> Starting Global DTB Build..."
-          # 使用标准方式编译所有 DTB
-          # -j$(nproc): 多核并行
-          # 如果遇到错误，Action 会在此处停止
+          echo ">>> Compiling DTBs and Overlays..."
+          # make dtbs 会自动递归编译所有 dtb 和 overlay
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- dtbs -j$(nproc)
 
-      - name: Package & Upload
+      - name: Package with Structure
         run: |
           echo ">>> Packaging..."
-          # 创建打包目录
-          mkdir -p output_dtbs
           
-          # 收集所有编译成功的 Rockchip DTB
-          cp arch/arm64/boot/dts/rockchip/*.dtb output_dtbs/
+          # 进入 dtb 所在的目录
+          cd arch/arm64/boot/dts/rockchip/
           
-          # 打包
-          cd output_dtbs
-          tar -zcvf ../all-rockchip-dtbs.tar.gz *.dtb
-          cd ..
+          # 1. 查找当前目录及子目录(overlay)下的所有 .dtb 和 .dtbo 文件
+          # 2. 将列表输出到临时文件
+          find . -type f \( -name "*.dtb" -o -name "*.dtbo" \) > ../../../../../filelist.txt
           
-          # 上传 Release
-          echo ">>> Uploading..."
-          gh release upload ${{ env.RELEASE_TAG }} all-rockchip-dtbs.tar.gz --clobber -R ${{ github.repository }}
+          # 3. 按照列表打包，保留目录结构
+          tar -zcvf ../../../../../dtbs-with-overlay.tar.gz -T ../../../../../filelist.txt
+          
+          cd ../../../../../
+          
+          # 验证内容
+          echo ">>> Checking content (first 10 files):"
+          tar -tf dtbs-with-overlay.tar.gz | head -n 10
+
+      - name: Upload Release
+        run: |
+          gh release upload ${{ env.RELEASE_TAG }} dtbs-with-overlay.tar.gz --clobber -R ${{ github.repository }}
