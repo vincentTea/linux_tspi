@@ -1,4 +1,4 @@
-name: Build Hibuffx AP6212 Image (Perfect)
+name: Build Hibuffx AP6212 Image (Dynamic Path)
 
 on:
   workflow_dispatch:
@@ -21,14 +21,9 @@ on:
 
 env:
   ARCH: arm64
-  src_path: /home/runner/work/linux/linux
-  modules_install_path: /home/runner/work/linux/linux/modules
-  
   # === 定义名称 ===
-  # 欺骗系统：生成此标准名 DTB，但内容是 Hibuffx
   DTB_STANDARD: rk3566-lckfb-tspi
   CUSTOM_SUFFIX: hibuffx
-  
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
@@ -49,7 +44,6 @@ jobs:
           TAG_NAME="Hibuffx-$(date +'%Y%m%d-%H%M')"
           echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
           
-          # 显式指定仓库 -R，防止环境上下文丢失
           gh release create "$TAG_NAME" \
             --title "Hibuffx Build $TAG_NAME" \
             --notes "DTS: Hibuffx (DSI). Firmware: TSPI AP6212." \
@@ -75,12 +69,20 @@ jobs:
           tar xf arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
           echo "$(pwd)/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin" >> $GITHUB_PATH
 
-      - name: Setup Paths
+      # === [核心修复] 动态设置路径变量 ===
+      - name: Setup Dynamic Paths
         run: |
-          echo "armbian_path=${{ env.src_path }}/armbian_boot" >> $GITHUB_ENV
-          echo "dtb_path=${{ env.src_path }}/dtbs" >> $GITHUB_ENV
-          echo "armbian_file_path=${{ env.src_path }}/armbian_boot_files" >> $GITHUB_ENV
-          mkdir -p ${{ env.src_path }}/armbian_boot ${{ env.src_path }}/armbian_boot_files ${{ env.modules_install_path }}
+          # 使用 GITHUB_WORKSPACE 获取真实根目录
+          WORK_DIR="${{ github.workspace }}"
+          
+          echo "src_path=$WORK_DIR" >> $GITHUB_ENV
+          echo "modules_install_path=$WORK_DIR/modules_install" >> $GITHUB_ENV
+          echo "armbian_path=$WORK_DIR/armbian_boot" >> $GITHUB_ENV
+          echo "dtb_path=$WORK_DIR/dtbs" >> $GITHUB_ENV
+          echo "armbian_file_path=$WORK_DIR/armbian_boot_files" >> $GITHUB_ENV
+          
+          # 创建目录
+          mkdir -p "$WORK_DIR/modules_install" "$WORK_DIR/armbian_boot" "$WORK_DIR/armbian_boot_files"
 
       # === 核心策略：覆盖 DTS (欺骗系统) ===
       - name: Configure Kernel & DTS Overwrite
@@ -168,39 +170,29 @@ jobs:
           gh release upload ${{ env.RELEASE_TAG }} $BOOT_NAME --clobber -R ${{ github.repository }}
           echo "BOOT_IMG_NAME=$BOOT_NAME" >> $GITHUB_ENV
 
-      # === Package Firmware (TSPI Specific) ===
+      # === Package Firmware ===
       - name: Package Firmware (TSPI Specific)
         run: |
           cd ${{ env.src_path }}
           mkdir -p temp_fw_pack
           
-          # 1. 检查是否存在你提到的 tspi_wifi_firmware 目录
           if [ -d "tspi_wifi_firmware" ]; then
-             echo "SUCCESS: 发现 'tspi_wifi_firmware' 目录"
              cp -r tspi_wifi_firmware/* temp_fw_pack/
-          
-          # 2. 回退检查 firmware 目录
           elif [ -d "firmware" ]; then
-             echo "WARNING: 未找到 tspi 目录，使用标准 firmware 目录"
              cp -r firmware/* temp_fw_pack/
-          
           else
-             echo "ERROR: 未找到固件目录，创建空文件以防报错"
              echo "Missing firmware" > temp_fw_pack/missing.txt
           fi
           
-          # 3. 兼容性处理 (确保 nvram.txt 存在)
           cd temp_fw_pack
           if [ -f "brcmfmac43438a1-sdio.txt" ] && [ ! -f "nvram.txt" ]; then
-              echo ">>> 创建 nvram.txt 兼容副本..."
               cp brcmfmac43438a1-sdio.txt nvram.txt
           fi
           
-          # 打包
           cd ..
           tar -zcf ap6212_wifi_firmware.tar.gz -C temp_fw_pack .
           
-          # Headers 打包
+          # Headers
           KVER=${{ env.REAL_VER }}
           HEADER_DIR="linux-headers-$KVER"
           mkdir -p $HEADER_DIR/arch/arm64
@@ -249,7 +241,6 @@ jobs:
           apt-get install -y initramfs-tools u-boot-tools busybox-static kmod linux-base
           sed -i "s|^update_initramfs=.*|update_initramfs=no|g" /etc/initramfs-tools/update-initramfs.conf
           sed -i "s|^COMPRESS=.*|COMPRESS=gzip|g" /etc/initramfs-tools/initramfs.conf
-          echo "Generating initrd for $KVER..."
           update-initramfs -c -k $KVER
           mkimage -A arm64 -O linux -T ramdisk -C gzip -a 0 -e 0 -n uInitrd -d /boot/initrd.img-$KVER /boot/uInitrd-$KVER
           EOF
@@ -288,7 +279,6 @@ jobs:
           fi
           
           tar -zcf armbian_boot-$KVER.tar.gz *
-          # [关键修复] 添加 -R 参数
           gh release upload ${{ env.RELEASE_TAG }} armbian_boot-$KVER.tar.gz --clobber -R ${{ github.repository }}
 
       # === Final Packaging (Flashable) ===
@@ -298,11 +288,11 @@ jobs:
           mkdir -p final_pack
           cd final_pack
           
+          # [关键修复] 使用动态路径移动文件
           mv ${{ env.src_path }}/${{ env.BOOT_IMG_NAME }} .
           cp ${{ env.armbian_path }}/modules-$KVER.tar.gz .
           cp ${{ env.armbian_path }}/headers-$KVER.tar.gz .
           cp ${{ env.armbian_path }}/ap6212_wifi_firmware.tar.gz .
           
           tar -zcvf rk3566-tspi-${{ env.CUSTOM_SUFFIX }}-$KVER.tar.gz *
-          # [关键修复] 添加 -R 参数
           gh release upload ${{ env.RELEASE_TAG }} rk3566-tspi-${{ env.CUSTOM_SUFFIX }}-$KVER.tar.gz --clobber -R ${{ github.repository }}
