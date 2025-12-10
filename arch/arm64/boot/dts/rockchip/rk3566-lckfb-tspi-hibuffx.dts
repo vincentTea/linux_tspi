@@ -15,7 +15,7 @@
 #include "rk3566.dtsi"
 
 / {
-	model = "LCKFB Taishan Pi RK3566";
+	model = "LCKFB Taishan Pi RK3566 HiBuffx";
 	compatible = "lckfb,tspi-rk3566", "rockchip,rk3566";
 
 	aliases {
