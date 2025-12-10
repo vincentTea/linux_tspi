@@ -41,12 +41,13 @@ jobs:
       - name: Initialize Release
         id: create_release
         run: |
-          TAG_NAME="Hibuffx-$(date +'%Y%m%d-%H%M')"
+          # 强制使用上海时间
+          TAG_NAME="Hibuffx-$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M')"
           echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
           
           gh release create "$TAG_NAME" \
-            --title "Hibuffx Build $TAG_NAME" \
-            --notes "DTS: Hibuffx (DSI). Firmware: TSPI AP6212." \
+            --title "Hibuffx Build $TAG_NAME (CST)" \
+            --notes "DTS: Hibuffx (Original Name). Firmware: TSPI AP6212. Build Time: $(TZ=Asia/Shanghai date)" \
             --draft=false \
             --prerelease=false \
             -R ${{ github.repository }}
@@ -69,27 +70,23 @@ jobs:
           tar xf arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
           echo "$(pwd)/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin" >> $GITHUB_PATH
 
-      # === [核心修复] 动态设置路径变量 ===
       - name: Setup Dynamic Paths
         run: |
-          # 使用 GITHUB_WORKSPACE 获取真实根目录
           WORK_DIR="${{ github.workspace }}"
-          
           echo "src_path=$WORK_DIR" >> $GITHUB_ENV
           echo "modules_install_path=$WORK_DIR/modules_install" >> $GITHUB_ENV
           echo "armbian_path=$WORK_DIR/armbian_boot" >> $GITHUB_ENV
           echo "dtb_path=$WORK_DIR/dtbs" >> $GITHUB_ENV
           echo "armbian_file_path=$WORK_DIR/armbian_boot_files" >> $GITHUB_ENV
-          
-          # 创建目录
-          mkdir -p "$WORK_DIR/modules_install" "$WORK_DIR/armbian_boot" "$WORK_DIR/armbian_boot_files"
+          mkdir -p "$WORK_DIR/modules_install" "$WORK_DIR/armbian_boot" "$WORK_DIR/armbian_boot_files" "$WORK_DIR/dtbs"
 
-      # === 核心策略：覆盖 DTS (欺骗系统) ===
-      - name: Configure Kernel & DTS Overwrite
+      # === 核心策略：不再覆盖 DTS，但保留防止 dirty 的机制 ===
+      - name: Configure Kernel
         run: |
-          echo ">>> [策略] 覆盖 DTS (标准名 <- Hibuffx内容)..."
-          cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dts \
-             arch/arm64/boot/dts/rockchip/${{ env.DTB_STANDARD }}.dts
+          echo ">>> [策略] 使用原生文件名，不覆盖 DTS..."
+          
+          # 创建一个空的 .scmversion 文件，确保去除 -dirty 后缀
+          echo "" > .scmversion
           
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- tspi_defconfig
 
@@ -113,7 +110,6 @@ jobs:
                 gh release upload ${{ env.RELEASE_TAG }} arch/arm64/boot/Image --clobber -R ${{ github.repository }}
             fi
             
-            # 智能打包依赖
             if [ ! -f "Module.symvers" ] && [ -f "vmlinux.symvers" ]; then
                 cp vmlinux.symvers Module.symvers
             fi
@@ -139,7 +135,6 @@ jobs:
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_install INSTALL_MOD_PATH=${{ env.modules_install_path }}
           fi
           
-          # 寻找真实版本号路径
           if [ -d "${{ env.modules_install_path }}/lib/modules" ]; then
               CD_PATH="${{ env.modules_install_path }}/lib/modules"
           else
@@ -155,14 +150,26 @@ jobs:
             gh release upload ${{ env.RELEASE_TAG }} modules-$REAL_VER.tar.gz --clobber -R ${{ github.repository }}
           fi
 
-      # === Boot.img & DTB ===
-      - name: Build Boot Image & DTB
+      # === Build All DTBs & Boot Image ===
+      - name: Build All DTBs & Boot Image
         run: |
-          echo ">>> 编译 DTB..."
-          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- rockchip/${{ env.DTB_STANDARD }}.dtb
+          echo ">>> [编译] 编译所有 DTBs (同 build-dtbs action)..."
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- dtbs -j$(nproc)
           
-          echo ">>> 制作 boot.img..."
-          ./scripts/resource_tool arch/arm64/boot/dts/rockchip/${{ env.DTB_STANDARD }}.dtb
+          echo ">>> [打包] 打包所有 DTB 和 Overlay..."
+          cd arch/arm64/boot/dts/rockchip/
+          find . -type f \( -name "*.dtb" -o -name "*.dtbo" \) > ../../../../../dtb-filelist.txt
+          tar -zcvf ../../../../../dtbs-with-overlay.tar.gz -T ../../../../../dtb-filelist.txt
+          
+          # 同时也复制一份我们要用的特定 DTB 出来备用
+          cp rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dtb ../../../../../target_dtb.dtb
+          cd ../../../../../
+          
+          gh release upload ${{ env.RELEASE_TAG }} dtbs-with-overlay.tar.gz --clobber -R ${{ github.repository }}
+          
+          echo ">>> [制作] 制作 boot.img (使用自定义后缀 DTB)..."
+          # 注意：这里我们明确使用带有后缀的 DTB，不再使用标准名，因为没有进行 cp 覆盖
+          ./scripts/resource_tool target_dtb.dtb
           ./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
           
           BOOT_NAME="rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.REAL_VER }}.img"
@@ -200,17 +207,19 @@ jobs:
           cp -a arch/arm64/include arch/arm64/kvm arch/arm64/Makefile $HEADER_DIR/arch/arm64/ || true
           tar -zcf linux-headers-$KVER.tar.gz $HEADER_DIR
 
-      # === Process Armbian DTB ===
+      # === Process Armbian DTB (保持原逻辑，放入 Armbian 包) ===
       - name: Process Armbian DTB
         run: |
           mkdir -p ${{ env.dtb_path }}/dtb/rockchip
-          cp arch/arm64/boot/dts/rockchip/${{ env.DTB_STANDARD }}.dtb ${{ env.dtb_path }}/dtb/rockchip/
+          
+          # 这里的逻辑是将我们想要的那个 DTS 复制进去，并确保 Armbian 也能读到
+          # 注意：为了兼容，我还是将带后缀的 DTB 复制进去
+          cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dtb ${{ env.dtb_path }}/dtb/rockchip/
           
           cd ${{ env.dtb_path }}/dtb/rockchip
-          dtc -I dtb -O dts ${{ env.DTB_STANDARD }}.dtb -o file.dts
-          sed -i '/mmcblk0p3/d' file.dts
-          dtc -I dts -O dtb file.dts -o ${{ env.DTB_STANDARD }}.dtb
-          rm file.dts
+          
+          # 如果你想让 Armbian 的脚本默认识别，可能需要将带后缀的复制一份为标准名(可选)
+          # cp rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dtb ${{ env.DTB_STANDARD }}.dtb
           
           tar -zcf dtb-rockchip-${{ env.REAL_VER }}.tar.gz *
           mv dtb-rockchip-${{ env.REAL_VER }}.tar.gz ${{ env.armbian_path }}/
@@ -288,7 +297,6 @@ jobs:
           mkdir -p final_pack
           cd final_pack
           
-          # [关键修复] 使用动态路径移动文件
           mv ${{ env.src_path }}/${{ env.BOOT_IMG_NAME }} .
           cp ${{ env.armbian_path }}/modules-$KVER.tar.gz .
           cp ${{ env.armbian_path }}/headers-$KVER.tar.gz .
