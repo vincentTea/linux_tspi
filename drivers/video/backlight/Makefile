@@ -2,7 +2,7 @@
 # Backlight & LCD drivers
 
 obj-$(CONFIG_LCD_AMS369FG06)		+= ams369fg06.o
-obj-y		+= lcd.o
+obj-$(CONFIG_LCD_CLASS_DEVICE)		+= lcd.o
 obj-$(CONFIG_LCD_CORGI)			+= corgi_lcd.o
 obj-$(CONFIG_LCD_HP700)			+= jornada720_lcd.o
 obj-$(CONFIG_LCD_HX8357)		+= hx8357.o
