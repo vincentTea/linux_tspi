@@ -1,4 +1,4 @@
-name: Build Hibuffx AP6212 Image
+name: Build Hibuffx AP6212 Image (Perfect)
 
 on:
   workflow_dispatch:
@@ -49,11 +49,13 @@ jobs:
           TAG_NAME="Hibuffx-$(date +'%Y%m%d-%H%M')"
           echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
           
+          # 显式指定仓库 -R，防止环境上下文丢失
           gh release create "$TAG_NAME" \
             --title "Hibuffx Build $TAG_NAME" \
             --notes "DTS: Hibuffx (DSI). Firmware: TSPI AP6212." \
             --draft=false \
-            --prerelease=false
+            --prerelease=false \
+            -R ${{ github.repository }}
 
       - name: Install Tools & Deps
         run: |
@@ -106,7 +108,7 @@ jobs:
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
             
             if [ -f "arch/arm64/boot/Image" ]; then
-                gh release upload ${{ env.RELEASE_TAG }} arch/arm64/boot/Image --clobber
+                gh release upload ${{ env.RELEASE_TAG }} arch/arm64/boot/Image --clobber -R ${{ github.repository }}
             fi
             
             # 智能打包依赖
@@ -114,7 +116,7 @@ jobs:
                 cp vmlinux.symvers Module.symvers
             fi
             tar -zcf build-deps.tar.gz .config Module.symvers vmlinux.symvers System.map 2>/dev/null || tar -zcf build-deps.tar.gz .config System.map
-            gh release upload ${{ env.RELEASE_TAG }} build-deps.tar.gz --clobber
+            gh release upload ${{ env.RELEASE_TAG }} build-deps.tar.gz --clobber -R ${{ github.repository }}
           fi
 
       # === Modules (复用/编译) ===
@@ -148,7 +150,7 @@ jobs:
           
           if [[ -z "$MOD_URL" ]]; then
             tar -zcf modules-$REAL_VER.tar.gz -C $CD_PATH $REAL_VER
-            gh release upload ${{ env.RELEASE_TAG }} modules-$REAL_VER.tar.gz --clobber
+            gh release upload ${{ env.RELEASE_TAG }} modules-$REAL_VER.tar.gz --clobber -R ${{ github.repository }}
           fi
 
       # === Boot.img & DTB ===
@@ -163,10 +165,10 @@ jobs:
           
           BOOT_NAME="rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.REAL_VER }}.img"
           mv boot.img $BOOT_NAME
-          gh release upload ${{ env.RELEASE_TAG }} $BOOT_NAME --clobber
+          gh release upload ${{ env.RELEASE_TAG }} $BOOT_NAME --clobber -R ${{ github.repository }}
           echo "BOOT_IMG_NAME=$BOOT_NAME" >> $GITHUB_ENV
 
-      # === [核心修复] 定向打包 TSPI 固件 ===
+      # === Package Firmware (TSPI Specific) ===
       - name: Package Firmware (TSPI Specific)
         run: |
           cd ${{ env.src_path }}
@@ -189,7 +191,6 @@ jobs:
           
           # 3. 兼容性处理 (确保 nvram.txt 存在)
           cd temp_fw_pack
-          # 如果存在 brcmfmac43438a1-sdio.txt 但没有 nvram.txt，复制一份
           if [ -f "brcmfmac43438a1-sdio.txt" ] && [ ! -f "nvram.txt" ]; then
               echo ">>> 创建 nvram.txt 兼容副本..."
               cp brcmfmac43438a1-sdio.txt nvram.txt
@@ -287,7 +288,8 @@ jobs:
           fi
           
           tar -zcf armbian_boot-$KVER.tar.gz *
-          gh release upload ${{ env.RELEASE_TAG }} armbian_boot-$KVER.tar.gz --clobber
+          # [关键修复] 添加 -R 参数
+          gh release upload ${{ env.RELEASE_TAG }} armbian_boot-$KVER.tar.gz --clobber -R ${{ github.repository }}
 
       # === Final Packaging (Flashable) ===
       - name: Final Packaging (Flashable)
@@ -302,4 +304,5 @@ jobs:
           cp ${{ env.armbian_path }}/ap6212_wifi_firmware.tar.gz .
           
           tar -zcvf rk3566-tspi-${{ env.CUSTOM_SUFFIX }}-$KVER.tar.gz *
-          gh release upload ${{ env.RELEASE_TAG }} rk3566-tspi-${{ env.CUSTOM_SUFFIX }}-$KVER.tar.gz --clobber
+          # [关键修复] 添加 -R 参数
+          gh release upload ${{ env.RELEASE_TAG }} rk3566-tspi-${{ env.CUSTOM_SUFFIX }}-$KVER.tar.gz --clobber -R ${{ github.repository }}
