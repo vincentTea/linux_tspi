@@ -1,4 +1,4 @@
-#include "linux/stddef.h"
+#include <linux/stddef.h>
 #include <linux/kernel.h>
 #include <linux/hrtimer.h>
 #include <linux/i2c.h>
@@ -37,7 +37,8 @@ struct gp7101_backlight_data {
     
 };
 
-s32 i2c_read(struct i2c_client *client,u8 *addr,u8 addr_len, u8 *buf, s32 len)
+/* 修改点1：添加 static 关键字，消除 warning */
+static s32 i2c_read(struct i2c_client *client,u8 *addr,u8 addr_len, u8 *buf, s32 len)
 {
     struct i2c_msg msgs[2];
     s32 ret=-1;
@@ -62,7 +63,8 @@ s32 i2c_read(struct i2c_client *client,u8 *addr,u8 addr_len, u8 *buf, s32 len)
     return -1;
 }
 
-s32 i2c_write(struct i2c_client *client, u8 *addr, u8 addr_len, u8 *buf,s32 len)
+/* 修改点1：添加 static 关键字，消除 warning */
+static s32 i2c_write(struct i2c_client *client, u8 *addr, u8 addr_len, u8 *buf,s32 len)
 {
     struct i2c_msg msg;
     s32 ret = -1;
@@ -120,8 +122,12 @@ static struct backlight_ops gp7101_backlight_ops = {
     .update_status = gp7101_backlight_set,
 };
 
-static int gp7101_bl_probe(struct i2c_client *client,
-            const struct i2c_device_id *id)
+/* 
+ * 修改点2：修改 probe 函数原型 
+ * 旧内核: int gp7101_bl_probe(struct i2c_client *client, const struct i2c_device_id *id)
+ * 新内核: int gp7101_bl_probe(struct i2c_client *client)
+ */
+static int gp7101_bl_probe(struct i2c_client *client)
 {
     struct backlight_device *bl;
     struct gp7101_backlight_data *data;
