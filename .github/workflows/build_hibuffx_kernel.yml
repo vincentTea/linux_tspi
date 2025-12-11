@@ -8,7 +8,6 @@ on:
         required: true
         default: 'vincentTea-hibuffx'
       
-      # === [断点续传] 填入 Release 链接可跳过编译 ===
       reuse_kernel_img:
         description: '[加速] Image URL (复用内核)'
         required: false
@@ -21,7 +20,6 @@ on:
 
 env:
   ARCH: arm64
-  # === 定义名称 ===
   DTB_STANDARD: rk3566-lckfb-tspi
   CUSTOM_SUFFIX: hibuffx
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -41,13 +39,12 @@ jobs:
       - name: Initialize Release
         id: create_release
         run: |
-          # 强制使用上海时间
           TAG_NAME="Hibuffx-$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M')"
           echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
           
           gh release create "$TAG_NAME" \
             --title "Hibuffx Build $TAG_NAME (CST)" \
-            --notes "DTS: Hibuffx (Original Name). Firmware: TSPI AP6212. Build Time: $(TZ=Asia/Shanghai date)" \
+            --notes "DTS: Full Rockchip Set. Firmware: TSPI AP6212. Build Time: $(TZ=Asia/Shanghai date)" \
             --draft=false \
             --prerelease=false \
             -R ${{ github.repository }}
@@ -56,16 +53,13 @@ jobs:
         run: |
           chmod +x scripts/mkimg scripts/resource_tool scripts/mkbootimg scripts/* || true
           
-          # LZ4
           LZ4_LATEST=$(curl -s https://api.github.com/repos/lz4/lz4/releases/latest | grep 'tarball_url' | cut -d\" -f4)
           wget $LZ4_LATEST -O lz4.tar.gz && tar -xzf lz4.tar.gz && cd lz4-lz4-* && make -j$(nproc) && sudo make install && sudo ldconfig
           
-          # Apt Deps
           sudo apt-get update
           sudo apt-get install -y device-tree-compiler u-boot-tools libssl-dev bc flex bison libncurses-dev initramfs-tools busybox-static tree
           sudo -E apt-get -y install $(curl -fsSL https://tinyurl.com/ubuntu2204-build-armbian)
           
-          # Toolchain
           wget https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
           tar xf arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
           echo "$(pwd)/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin" >> $GITHUB_PATH
@@ -80,17 +74,18 @@ jobs:
           echo "armbian_file_path=$WORK_DIR/armbian_boot_files" >> $GITHUB_ENV
           mkdir -p "$WORK_DIR/modules_install" "$WORK_DIR/armbian_boot" "$WORK_DIR/armbian_boot_files" "$WORK_DIR/dtbs"
 
-      # === 核心策略：不再覆盖 DTS，但保留防止 dirty 的机制 ===
-      - name: Configure Kernel
+      # === 核心策略：Git Commit 法去除 Dirty ===
+      - name: Configure Kernel & Clean Git State
         run: |
-          echo ">>> [策略] 使用原生文件名，不覆盖 DTS..."
-          
-          # 创建一个空的 .scmversion 文件，确保去除 -dirty 后缀
-          echo "" > .scmversion
-          
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- tspi_defconfig
+          
+          echo ">>> [策略] 执行 Git Commit 以清除 Dirty 状态..."
+          git config --global user.email "support@hibuffx.com"
+          git config --global user.name "HiBuffxEngineer"
+          git add .
+          git commit -m "Auto-commit to clean dirty state" || echo "No changes to commit"
 
-      # === Kernel Image (复用/编译) ===
+      # === Kernel Image ===
       - name: Process Kernel Image
         run: |
           IMG_URL="${{ github.event.inputs.reuse_kernel_img }}"
@@ -117,7 +112,7 @@ jobs:
             gh release upload ${{ env.RELEASE_TAG }} build-deps.tar.gz --clobber -R ${{ github.repository }}
           fi
 
-      # === Modules (复用/编译) ===
+      # === Modules ===
       - name: Process Modules
         run: |
           MOD_URL="${{ github.event.inputs.reuse_modules_tar }}"
@@ -153,22 +148,20 @@ jobs:
       # === Build All DTBs & Boot Image ===
       - name: Build All DTBs & Boot Image
         run: |
-          echo ">>> [编译] 编译所有 DTBs (同 build-dtbs action)..."
+          echo ">>> [编译] 编译所有 DTBs..."
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- dtbs -j$(nproc)
           
-          echo ">>> [打包] 打包所有 DTB 和 Overlay..."
+          echo ">>> [打包] 独立 DTB 包 (dtbs-with-overlay.tar.gz)..."
           cd arch/arm64/boot/dts/rockchip/
           find . -type f \( -name "*.dtb" -o -name "*.dtbo" \) > ../../../../../dtb-filelist.txt
           tar -zcvf ../../../../../dtbs-with-overlay.tar.gz -T ../../../../../dtb-filelist.txt
           
-          # 同时也复制一份我们要用的特定 DTB 出来备用
           cp rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dtb ../../../../../target_dtb.dtb
           cd ../../../../../
           
           gh release upload ${{ env.RELEASE_TAG }} dtbs-with-overlay.tar.gz --clobber -R ${{ github.repository }}
           
-          echo ">>> [制作] 制作 boot.img (使用自定义后缀 DTB)..."
-          # 注意：这里我们明确使用带有后缀的 DTB，不再使用标准名，因为没有进行 cp 覆盖
+          echo ">>> [制作] 制作 boot.img..."
           ./scripts/resource_tool target_dtb.dtb
           ./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
           
@@ -207,21 +200,24 @@ jobs:
           cp -a arch/arm64/include arch/arm64/kvm arch/arm64/Makefile $HEADER_DIR/arch/arm64/ || true
           tar -zcf linux-headers-$KVER.tar.gz $HEADER_DIR
 
-      # === Process Armbian DTB (保持原逻辑，放入 Armbian 包) ===
+      # === Process Armbian DTB (修复点：包含所有DTB) ===
       - name: Process Armbian DTB
         run: |
+          # 1. 创建 Armbian 期望的目录结构： dtb/rockchip
           mkdir -p ${{ env.dtb_path }}/dtb/rockchip
           
-          # 这里的逻辑是将我们想要的那个 DTS 复制进去，并确保 Armbian 也能读到
-          # 注意：为了兼容，我还是将带后缀的 DTB 复制进去
-          cp arch/arm64/boot/dts/rockchip/rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dtb ${{ env.dtb_path }}/dtb/rockchip/
+          # 2. 进入编译好的 DTB 目录
+          cd arch/arm64/boot/dts/rockchip
           
-          cd ${{ env.dtb_path }}/dtb/rockchip
+          echo ">>> [复制] 将所有编译好的 .dtb 和 .dtbo 复制到打包目录..."
+          # 使用 find + cp --parents 保持可能存在的子目录结构（虽然rk通常是平铺的，但为了保险）
+          find . -type f \( -name "*.dtb" -o -name "*.dtbo" \) -exec cp --parents {} ${{ env.dtb_path }}/dtb/rockchip/ \;
           
-          # 如果你想让 Armbian 的脚本默认识别，可能需要将带后缀的复制一份为标准名(可选)
-          # cp rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dtb ${{ env.DTB_STANDARD }}.dtb
+          # 3. 打包
+          cd ${{ env.dtb_path }}
+          # 这里的结构是 dtb/rockchip/*.dtb，符合 Armbian /boot/dtb/rockchip/ 的解压路径
+          tar -zcf dtb-rockchip-${{ env.REAL_VER }}.tar.gz dtb
           
-          tar -zcf dtb-rockchip-${{ env.REAL_VER }}.tar.gz *
           mv dtb-rockchip-${{ env.REAL_VER }}.tar.gz ${{ env.armbian_path }}/
 
       # === Initrd (Chroot) ===
