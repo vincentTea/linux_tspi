@@ -22,6 +22,7 @@
 #include <video/display_timing.h>
 #include <video/of_display_timing.h>
 #include <video/videomode.h>
+#include <video/mipi_display.h>
 
 struct panel_cmd_header {
 	u8 data_type;
