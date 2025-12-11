@@ -503,6 +503,12 @@ config BACKLIGHT_LED
 	  If you have a LCD backlight adjustable by LED class driver, say Y
 	  to enable this driver.
 
+config BACKLIGHT_GP7101
+	tristate "GP7101 Backlight Driver"
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  This enables support for GP7101 based backlight.
+
 endif # BACKLIGHT_CLASS_DEVICE
 
 endmenu
