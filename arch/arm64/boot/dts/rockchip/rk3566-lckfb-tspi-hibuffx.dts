@@ -758,8 +758,8 @@
        原代码: reg = <1>;  (对应 RGB0，错误)
        新代码: reg = <6>;  (对应 MIPI1/DSI1，正确)
     */
-    vp0_out_dsi1: endpoint@ROCKCHIP_VOP2_EP_MIPI1 {
-        reg = <ROCKCHIP_VOP2_EP_MIPI1>; 
+    vp0_out_dsi1: endpoint@ROCKCHIP_VOP2_EP_MIPI0 {
+        reg = <ROCKCHIP_VOP2_EP_MIPI0>; 
         /* 或者直接写: reg = <6>; */
         remote-endpoint = <&dsi1_in_vp0>;
     };
