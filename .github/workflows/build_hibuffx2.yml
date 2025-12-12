@@ -97,20 +97,15 @@ jobs:
             wget -O build-deps.tar.gz "$DEPS_URL"
             
             echo ">>> [恢复] 解压构建环境..."
-            # 使用 -p 保留权限（关键：脚本的可执行位），-x 解压
             tar -xpzf build-deps.tar.gz
-            
-            # 关键：更新 .config 时间戳，防止 make 误判需要重新配置
             touch .config
             
             echo ">>> [检查] 验证环境完整性..."
-            # 因为保留了 scripts/ 下的二进制文件，这一步应该极快
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
           else
             echo ">>> [全量] 编译 Image..."
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
             
-            # 确保符号表存在
             if [ ! -f "Module.symvers" ]; then
                 make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
             fi
@@ -121,13 +116,10 @@ jobs:
             
             # --- [优化打包策略] ---
             echo ">>> [清理] 准备打包依赖环境..."
-            
-            # 1. 删除 .git 目录（巨大且复用时无用）
             rm -rf .git
             
-            # 2. 删除 drivers, fs, net 等源码目录下的 .o 和 .a 文件 (节省空间)
-            # 关键：排除 scripts, tools, include, arch 目录，保留构建工具和架构相关对象
             echo "Removing unnecessary object files..."
+            # 排除 scripts, tools, include, arch, .config, Makefile 等关键文件
             find . -type f \( -name "*.o" -o -name "*.a" \) \
                 -not -path "./scripts/*" \
                 -not -path "./tools/*" \
@@ -135,14 +127,21 @@ jobs:
                 -not -path "./include/*" \
                 -delete
             
-            # 3. 删除未被使用的临时文件
             find . -name "*.cmd" -delete
             find . -name "*.tmp" -delete
             
-            echo ">>> [打包] 构建完整依赖包 (包含 vmlinux 和 scripts)..."
-            # 4. 打包当前目录所有内容 (保留了目录结构、vmlinux、scripts二进制、include等)
-            # 排除自身防止递归
-            tar -zcf build-deps.tar.gz --exclude=build-deps.tar.gz . 
+            echo ">>> [打包] 构建完整依赖包..."
+            # 【关键修复】
+            # 1. 写入 /tmp 避免 "file changed" 错误
+            # 2. 这里的 || [ $? -eq 1 ] 允许 tar 返回 1 (warning) 而不中断流程
+            # 3. --warning=no-file-changed 试图抑制该警告（GNU tar特性）
+            tar -zcf /tmp/build-deps.tar.gz . \
+                --warning=no-file-changed \
+                --exclude=.git \
+                || [ $? -eq 1 ]
+            
+            # 将打包好的文件移回当前目录
+            mv /tmp/build-deps.tar.gz .
 
             gh release upload ${{ env.RELEASE_TAG }} build-deps.tar.gz --clobber -R ${{ github.repository }}
           fi
