@@ -1,0 +1,157 @@
+name: Build Hibuffx Modules (GT9xx & DSI Panel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: 'Source tag to build from'
+        required: true
+        default: 'vincentTea-hibuffx'
+      reuse_build_deps:
+        description: '[必须] build-deps.tar.gz URL (复用配置)'
+        required: true
+
+env:
+  ARCH: arm64
+  # 使用系统自带编译器，足够编译 6.18 且速度更快
+  CROSS_COMPILE: aarch64-linux-gnu-
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build-modules:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_tag }}
+          submodules: false # 编译这两个模块通常不需要 submodule，加速拉取
+          fetch-depth: 1
+
+      - name: Initialize Release
+        id: create_release
+        run: |
+          TAG_NAME="Modules-Debug-$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M')"
+          echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
+          
+          gh release create "$TAG_NAME" \
+            --title "Modules Debug Build $TAG_NAME" \
+            --notes "Contains: panel-rockchip-dsi.ko & gt9xx.ko. Base: ${{ github.event.inputs.target_tag }}" \
+            --draft=false \
+            --prerelease=true \
+            -R ${{ github.repository }}
+
+      - name: Install Compiler & Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu build-essential libssl-dev bc bison flex wget
+
+      - name: Restore Build Environment
+        run: |
+          echo ">>> Downloading Build Deps..."
+          wget -O build-deps.tar.gz "${{ github.event.inputs.reuse_build_deps }}"
+          
+          echo ">>> Extracting..."
+          # 恢复 .config, Module.symvers 和必要的脚本
+          tar -xpzf build-deps.tar.gz
+          
+          if [ ! -f ".config" ]; then
+            echo "Error: .config not found in deps!"
+            exit 1
+          fi
+          
+          # 刷新时间戳，防止 make 以为配置文件过时而重新询问
+          touch .config
+
+      - name: Force Config for Target Modules
+        run: |
+          echo ">>> Modifying .config to ensure target modules are enabled as <M>..."
+          
+          # 1. 确保 DSI Panel 为 M
+          sed -i 's/CONFIG_DRM_PANEL_ROCKCHIP_DSI_GENERIC=y/CONFIG_DRM_PANEL_ROCKCHIP_DSI_GENERIC=m/' .config
+          if ! grep -q "CONFIG_DRM_PANEL_ROCKCHIP_DSI_GENERIC=m" .config; then
+             echo "CONFIG_DRM_PANEL_ROCKCHIP_DSI_GENERIC=m" >> .config
+          fi
+          
+          # 2. 确保 GT9xx 为 M
+          if ! grep -q "CONFIG_TOUCHSCREEN_GT9XX" .config; then
+             echo "CONFIG_TOUCHSCREEN_GT9XX=m" >> .config
+          else
+             sed -i 's/CONFIG_TOUCHSCREEN_GT9XX=y/CONFIG_TOUCHSCREEN_GT9XX=m/' .config
+          fi
+          
+          # 3. 禁用 Mainline 自带的 Goodix 以防冲突
+          sed -i 's/CONFIG_TOUCHSCREEN_GOODIX=m/# CONFIG_TOUCHSCREEN_GOODIX is not set/' .config
+          sed -i 's/CONFIG_TOUCHSCREEN_GOODIX=y/# CONFIG_TOUCHSCREEN_GOODIX is not set/' .config
+          
+          # 4. 确保 Makefile 包含 GT9xx
+          # 如果你的源码里 drivers/input/touchscreen/Makefile 还没加这句话，这里自动补上
+          if ! grep -q "gt9xx/" drivers/input/touchscreen/Makefile; then
+             echo "Adding gt9xx to Makefile..."
+             echo "obj-\$(CONFIG_TOUCHSCREEN_GT9XX) += gt9xx/" >> drivers/input/touchscreen/Makefile
+          fi
+
+      - name: Optimize Makefiles (Speed Up)
+        run: |
+          echo ">>> Optimizing DRM Makefile..."
+          # 屏蔽巨型驱动，大幅减少编译时间
+          sed -i 's|obj-$(CONFIG_DRM_NOUVEAU)|#|g' drivers/gpu/drm/Makefile
+          sed -i 's|obj-$(CONFIG_DRM_AMDGPU)|#|g' drivers/gpu/drm/Makefile
+          sed -i 's|obj-$(CONFIG_DRM_RADEON)|#|g' drivers/gpu/drm/Makefile
+          sed -i 's|obj-$(CONFIG_DRM_I915)|#|g' drivers/gpu/drm/Makefile
+          sed -i 's|obj-$(CONFIG_DRM_XE)|#|g' drivers/gpu/drm/Makefile
+          
+          # 独占编译 Panel：防止其他 Panel 驱动报错
+          echo "obj-\$(CONFIG_DRM_PANEL_ROCKCHIP_DSI_GENERIC) += panel-rockchip-dsi.o" > drivers/gpu/drm/panel/Makefile
+
+      - name: Prepare Kernel Headers
+        run: |
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE modules_prepare -j$(nproc)
+
+      - name: Compile 1. CEC (Dependency)
+        run: |
+          # DRM 依赖 CEC，必须先编译
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE M=drivers/media/cec modules -j$(nproc) || true
+          
+          # 尝试合并符号表（如果有）
+          if [ -f "drivers/media/cec/Module.symvers" ]; then
+             cat drivers/media/cec/Module.symvers >> Module.symvers
+          fi
+
+      - name: Compile 2. DRM & Panel
+        run: |
+          # 编译 DRM 核心和你的 DSI Panel
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE M=drivers/gpu/drm modules -j$(nproc)
+
+      - name: Compile 3. GT9xx Touchscreen
+        run: |
+          # 编译触摸屏驱动
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE M=drivers/input/touchscreen modules -j$(nproc)
+
+      - name: Collect & Upload Artifacts
+        run: |
+          mkdir -p output_modules
+          
+          echo ">>> Searching for .ko files..."
+          
+          # 查找 Panel 驱动
+          find drivers/gpu/drm/panel -name "panel-rockchip-dsi*.ko" -exec cp {} output_modules/ \;
+          
+          # 查找 GT9xx 驱动 (注意：如果 gt9xx 是文件夹，ko 可能在 gt9xx/ 下)
+          find drivers/input/touchscreen -name "gt9xx.ko" -exec cp {} output_modules/ \;
+          # 以防万一名字不一样（比如 goodix_gt9xx.ko），扩大搜索范围
+          find drivers/input/touchscreen/gt9xx -name "*.ko" -exec cp -n {} output_modules/ \;
+          
+          cd output_modules
+          ls -lh
+          
+          # 打包上传
+          tar -zcf ../modules-debug.tar.gz *
+          
+          # 上传到 Release
+          gh release upload ${{ env.RELEASE_TAG }} ../modules-debug.tar.gz --clobber -R ${{ github.repository }}
+          
+          # 为了方便，也上传单独的 .ko
+          for f in *.ko; do
+            gh release upload ${{ env.RELEASE_TAG }} "$f" --clobber -R ${{ github.repository }}
+          done
