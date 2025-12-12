@@ -3,6 +3,11 @@
  *
  * Generic MIPI DSI Panel Driver for Rockchip platforms
  * Parses init commands from Device Tree (Ported from RK 6.1 BSP)
+ * 
+ * FEATURES:
+ * - Supports "panel-init-sequence" parsing
+ * - COMPATIBILITY: Automatically fixes legacy RK BSP command formats
+ *   (e.g., treating 0x11/0x29 as params instead of commands)
  */
 
 #include <linux/backlight.h>
@@ -11,6 +16,8 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/regulator/consumer.h>
+#include <linux/slab.h>    /* Added for kzalloc/kcalloc */
+#include <linux/err.h>     /* Added for IS_ERR/PTR_ERR */
 
 #include <drm/drm_crtc.h>
 #include <drm/drm_device.h>
@@ -23,6 +30,9 @@
 #include <video/of_display_timing.h>
 #include <video/videomode.h>
 #include <video/mipi_display.h>
+
+/* Debug macros */
+#define DBG_INFO(dev, fmt, ...) dev_info(dev, "[PANEL-DBG] " fmt, ##__VA_ARGS__)
 
 struct panel_cmd_header {
 	u8 data_type;
@@ -122,6 +132,10 @@ static int panel_parse_cmd_seq(struct device *dev, const u8 *data, int length,
 	return 0;
 }
 
+/* 
+ * 关键函数：增加兼容性处理逻辑
+ * 如果检测到 0x11 或 0x29，强制使用标准 DCS 发送，忽略 DTS 中的错误写法
+ */
 static int panel_dsi_xfer_cmd_seq(struct rockchip_dsi_panel *panel,
 				  struct panel_cmd_seq *seq)
 {
@@ -134,28 +148,49 @@ static int panel_dsi_xfer_cmd_seq(struct rockchip_dsi_panel *panel,
 
 	for (i = 0; i < seq->cmd_cnt; i++) {
 		struct panel_cmd_desc *cmd = &seq->cmds[i];
+		u8 type = cmd->header.data_type;
 		size_t len = cmd->header.payload_length;
+		const u8 *payload = cmd->payload;
+		u8 opcode = (len > 0) ? payload[0] : 0x00;
 
-		switch (cmd->header.data_type) {
-		case MIPI_DSI_DCS_SHORT_WRITE:
-		case MIPI_DSI_DCS_SHORT_WRITE_PARAM:
-		case MIPI_DSI_DCS_LONG_WRITE:
-			err = mipi_dsi_dcs_write_buffer(dsi, cmd->payload, len);
-			break;
-		case MIPI_DSI_GENERIC_SHORT_WRITE_0_PARAM:
-		case MIPI_DSI_GENERIC_SHORT_WRITE_1_PARAM:
-		case MIPI_DSI_GENERIC_SHORT_WRITE_2_PARAM:
-		case MIPI_DSI_GENERIC_LONG_WRITE:
-			err = mipi_dsi_generic_write(dsi, cmd->payload, len);
-			break;
-		default:
-			/* Fallback to generic if unsure, or ignore specific ones like delays if handled separately */
-			err = mipi_dsi_generic_write(dsi, cmd->payload, len);
-			break;
+		/* === Compatibility Fix for Rockchip Legacy DTS === */
+		/* Detect Sleep Out (0x11) or Display On (0x29) */
+		if (len > 0 && (opcode == MIPI_DCS_EXIT_SLEEP_MODE || 
+		                opcode == MIPI_DCS_SET_DISPLAY_ON ||
+		                opcode == MIPI_DCS_ENTER_SLEEP_MODE || 
+		                opcode == MIPI_DCS_SET_DISPLAY_OFF)) {
+			
+			/* 
+			 * Force use of mipi_dsi_dcs_write.
+			 * This function ignores extra payload bytes for these commands
+			 * and sets the correct Packet Type automatically.
+			 */
+			DBG_INFO(dev, "Fixing Legacy Cmd: 0x%02x (DTS Type: 0x%02x)\n", opcode, type);
+			err = mipi_dsi_dcs_write(dsi, opcode, NULL, 0);
+
+		} else {
+			/* Standard transmission for other commands */
+			switch (type) {
+			case MIPI_DSI_DCS_SHORT_WRITE:
+			case MIPI_DSI_DCS_SHORT_WRITE_PARAM:
+			case MIPI_DSI_DCS_LONG_WRITE:
+				err = mipi_dsi_dcs_write_buffer(dsi, payload, len);
+				break;
+			case MIPI_DSI_GENERIC_SHORT_WRITE_0_PARAM:
+			case MIPI_DSI_GENERIC_SHORT_WRITE_1_PARAM:
+			case MIPI_DSI_GENERIC_SHORT_WRITE_2_PARAM:
+			case MIPI_DSI_GENERIC_LONG_WRITE:
+				err = mipi_dsi_generic_write(dsi, payload, len);
+				break;
+			default:
+				/* Fallback */
+				err = mipi_dsi_generic_write(dsi, payload, len);
+				break;
+			}
 		}
 
 		if (err < 0) {
-			dev_err(dev, "failed to write cmd %d: %d\n", i, err);
+			dev_err(dev, "failed to write cmd %d (op=0x%02x): %d\n", i, opcode, err);
 			return err;
 		}
 
@@ -189,8 +224,8 @@ static int rockchip_dsi_panel_unprepare(struct drm_panel *panel)
 
 	panel_dsi_xfer_cmd_seq(p, p->exit_seq);
 
-	gpiod_set_value_cansleep(p->reset_gpio, 1);
-	gpiod_set_value_cansleep(p->enable_gpio, 0);
+	if (p->reset_gpio) gpiod_set_value_cansleep(p->reset_gpio, 1);
+	if (p->enable_gpio) gpiod_set_value_cansleep(p->enable_gpio, 0);
 	
 	if (p->supply)
 		regulator_disable(p->supply);
@@ -221,17 +256,21 @@ static int rockchip_dsi_panel_prepare(struct drm_panel *panel)
 	if (p->delay.prepare)
 		msleep(p->delay.prepare);
 
-	gpiod_set_value_cansleep(p->enable_gpio, 1);
+	if (p->enable_gpio)
+		gpiod_set_value_cansleep(p->enable_gpio, 1);
 
-	/* Toggling Reset */
-	gpiod_set_value_cansleep(p->reset_gpio, 1);
-	if (p->delay.reset)
-		msleep(p->delay.reset);
-	gpiod_set_value_cansleep(p->reset_gpio, 0);
+	/* Toggling Reset: Active Low logic (1=Active/Low, 0=Inactive/High) */
+	if (p->reset_gpio) {
+		gpiod_set_value_cansleep(p->reset_gpio, 1);
+		if (p->delay.reset)
+			msleep(p->delay.reset);
+		gpiod_set_value_cansleep(p->reset_gpio, 0);
+	}
 
 	if (p->delay.init)
 		msleep(p->delay.init);
 
+	DBG_INFO(panel->dev, "Sending Init Sequence...\n");
 	err = panel_dsi_xfer_cmd_seq(p, p->init_seq);
 	if (err < 0) {
 		dev_err(panel->dev, "failed to send init sequence\n");
@@ -258,6 +297,7 @@ static int rockchip_dsi_panel_enable(struct drm_panel *panel)
 		msleep(p->delay.enable);
 
 	p->enabled = true;
+	DBG_INFO(panel->dev, "Panel Enabled.\n");
 	return 0;
 }
 
@@ -307,6 +347,8 @@ static int rockchip_dsi_panel_probe(struct mipi_dsi_device *dsi)
 	const void *data;
 	int len, err;
 	u32 val;
+
+	dev_info(dev, "Probing Rockchip Generic DSI Panel (Compat Mode)\n");
 
 	panel = devm_kzalloc(dev, sizeof(*panel), GFP_KERNEL);
 	if (!panel)
@@ -364,13 +406,22 @@ static int rockchip_dsi_panel_probe(struct mipi_dsi_device *dsi)
 	/* 5. Timings */
 	panel->timing = devm_kzalloc(dev, sizeof(*panel->timing), GFP_KERNEL);
 	if (!panel->timing) return -ENOMEM;
-	err = of_get_display_timing(dev->of_node, "dsi1_timing0", panel->timing); // Search for label or default
-	if (err) {
-		// Try generic node name
-		err = of_get_display_timing(dev->of_node, "panel-timing", panel->timing);
-		if (err) return dev_err_probe(dev, err, "failed to get timing\n");
-	}
 	
+	/* Try custom label first (as requested) */
+	err = of_get_display_timing(dev->of_node, "dsi1_timing0", panel->timing);
+	if (err) {
+		/* Fallback to standard "panel-timing" */
+		err = of_get_display_timing(dev->of_node, "panel-timing", panel->timing);
+		if (err) {
+			/* Last resort: "display-timings" (old style) */
+			err = of_get_display_timing(dev->of_node, NULL, panel->timing);
+		}
+	}
+	if (err) return dev_err_probe(dev, err, "failed to get timing info\n");
+
+	DBG_INFO(dev, "Timing: %dx%d, pclk=%d\n", 
+		panel->timing->hactive.typ, panel->timing->vactive.typ, panel->timing->pixelclock.typ);
+
 	/* 6. Register Panel */
 	drm_panel_init(&panel->base, dev, &rockchip_dsi_panel_funcs, DRM_MODE_CONNECTOR_DSI);
 	
