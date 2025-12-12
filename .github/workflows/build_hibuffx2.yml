@@ -180,13 +180,35 @@ jobs:
           echo "dist_path=$(pwd)/output_dist" >> $GITHUB_ENV
 
       # === 7. 发布 Release ===
+      
+      # [新增步骤] 先生成 Tag 和标题，存入环境变量
+      - name: Generate Release Info
+        id: release_info
+        run: |
+          # 计算当前时间戳
+          TIMESTAMP=$(date +'%s')
+          # 计算可读时间 (中国时间)
+          READABLE_TIME=$(date +'%Y-%m-%d %H:%M:%S')
+          
+          # 组合 Tag 名字 (如: build-debug01-1715500000)
+          TAG_NAME="build-${{ inputs.cache_session_key }}-${TIMESTAMP}"
+          
+          # 组合标题名字
+          RELEASE_NAME="[${{ inputs.cache_session_key }}] @ ${READABLE_TIME}"
+          
+          # 写入环境变量，供下一步骤使用
+          echo "GEN_TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+          echo "GEN_RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
+          
+          echo "Generated Tag: $TAG_NAME"
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
-          # 标题格式：[Key] @ 2025-12-12 14:00:00
-          name: "[${{ inputs.cache_session_key }}] @ $(date +'%Y-%m-%d %H:%M:%S')"
-          # Tag 必须唯一，加上时间戳
-          tag_name: "build-${{ inputs.cache_session_key }}-$(date +'%s')"
+          # [修改] 这里直接引用上面生成的环境变量
+          name: ${{ env.GEN_RELEASE_NAME }}
+          tag_name: ${{ env.GEN_TAG_NAME }}
+          
           files: ${{ env.dist_path }}/*
           body: |
             ### Build Information
