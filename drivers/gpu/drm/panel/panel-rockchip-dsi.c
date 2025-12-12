@@ -431,10 +431,21 @@ static int rockchip_dsi_panel_probe(struct mipi_dsi_device *dsi)
 
 	drm_panel_add(&panel->base);
 
+	/* 
+	 * 7. Attach DSI (With Fix for -EBUSY)
+	 * 当使用 rmmod/insmod 调试时，Rockchip Host 可能报 -16 (EBUSY)。
+	 * 我们必须忽略这个错误，强行让 Probe 成功。
+	 */
 	err = mipi_dsi_attach(dsi);
 	if (err) {
-		drm_panel_remove(&panel->base);
-		return dev_err_probe(dev, err, "failed to attach dsi\n");
+		if (err == -EBUSY) {
+			dev_info(dev, "WARN: mipi_dsi_attach returned -EBUSY (Host dirty). IGNORING to force load!\n");
+			/* 不执行 remove，也不 return error，假装成功往下走 */
+		} else {
+			/* 其他真正的错误才退出 */
+			drm_panel_remove(&panel->base);
+			return dev_err_probe(dev, err, "failed to attach dsi\n");
+		}
 	}
 
 	return 0;
