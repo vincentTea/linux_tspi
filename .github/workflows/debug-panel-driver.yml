@@ -1,21 +1,20 @@
-name: Quick Debug Panel Driver (.ko only)
+name: Debug Panel Driver (Fix Symbols)
 
 on:
   workflow_dispatch:
     inputs:
       target_tag:
-        description: 'Git Branch/Tag to build from'
+        description: 'Git Branch/Tag'
         required: true
         default: 'vincentTea-hibuffx'
       deps_url:
-        description: 'URL of build-deps.tar.gz from previous full build'
+        description: 'URL of build-deps.tar.gz'
         required: true
         default: ''
 
 env:
   ARCH: arm64
-  # 使用相对路径，简化配置
-  CROSS_COMPILE: aarch64-none-linux-gnu-
+  CROSS_COMPILE: aarch64-linux-gnu-
 
 jobs:
   quick-build:
@@ -25,52 +24,60 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.target_tag }}
-          submodules: false # 调试驱动通常不需要 submodule，省时间
+          submodules: false
           fetch-depth: 1
 
       - name: Install Compiler & Tools
         run: |
-          # 为了极速，这里直接用 apt 安装编译器，通常足够编译 6.x 内核
-          # 如果必须用特定版本，可以保留你原有的下载步骤，但会慢几分钟
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu build-essential libssl-dev bc bison flex wget
-          
-          # 验证编译器版本
           aarch64-linux-gnu-gcc --version
 
       - name: Restore Build Environment
         run: |
           echo ">>> Downloading Build Deps..."
           wget -O build-deps.tar.gz "${{ github.event.inputs.deps_url }}"
-          
-          echo ">>> Extracting..."
-          # 解压到当前目录，恢复 .config 和 Module.symvers
           tar -xzf build-deps.tar.gz
           
-          # 简单验证
-          if [ ! -f ".config" ]; then
-            echo "Error: .config not found in deps!"
-            exit 1
-          fi
+          # 简单校验
+          if [ ! -f ".config" ]; then echo "Error: .config missing"; exit 1; fi
+          if [ ! -f "Module.symvers" ]; then echo "Error: Module.symvers missing"; exit 1; fi
+
+      - name: Optimize Makefiles (Save Time)
+        run: |
+          echo ">>> 正在修改 Makefile 以加速编译..."
+          
+          # 1. 在 DRM 父目录中，禁用巨型显卡驱动 (AMD, Nouveau, Intel等)，只保留核心
+          # 这可以把编译时间从 20分钟缩短到 2分钟
+          sed -i 's|obj-$(CONFIG_DRM_NOUVEAU)|#|g' drivers/gpu/drm/Makefile
+          sed -i 's|obj-$(CONFIG_DRM_AMDGPU)|#|g' drivers/gpu/drm/Makefile
+          sed -i 's|obj-$(CONFIG_DRM_RADEON)|#|g' drivers/gpu/drm/Makefile
+          sed -i 's|obj-$(CONFIG_DRM_I915)|#|g' drivers/gpu/drm/Makefile
+          
+          # 2. 在 Panel 目录中，只保留我们的 rockchip-dsi，屏蔽其他所有屏幕驱动
+          # 这样可以避免其他驱动因为缺符号报错 (你之前的报错就是 panel-boe 引起的)
+          echo "obj-\$(CONFIG_DRM_PANEL_ROCKCHIP_DSI_GENERIC) += panel-rockchip-dsi.o" > drivers/gpu/drm/panel/Makefile
 
       - name: Prepare Kernel Tree
         run: |
-          # 准备构建环境 (modules_prepare 会生成必要的头文件和 scripts)
-          # 注意：CROSS_COMPILE 使用 apt 安装的路径前缀
+          # 准备必要的头文件和脚本
           make ARCH=$ARCH CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
 
-      - name: Compile Panel Driver Only
+      - name: Compile DRM Core & Panel
         run: |
-          echo ">>> Compiling Panel Driver..."
-          # 只编译 drivers/gpu/drm/panel 目录
-          make ARCH=$ARCH CROSS_COMPILE=aarch64-linux-gnu- M=drivers/gpu/drm/panel modules -j$(nproc)
+          echo ">>> Compiling DRM Core and Panel..."
+          # 我们直接编译 drivers/gpu/drm 目录
+          # 由于上面屏蔽了重型驱动，这里只会编译 drm.ko, drm_kms_helper.ko 和我们的 panel
+          # 这样会自动生成缺失的符号，并链接成功
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-linux-gnu- M=drivers/gpu/drm modules -j$(nproc)
 
       - name: Locate & Upload KO
         uses: actions/upload-artifact@v4
         with:
           name: panel-rockchip-dsi-debug
+          # 注意：虽然我们在 drm 目录 make，但 .ko 还是会在 panel 子目录生成
           path: drivers/gpu/drm/panel/panel-rockchip-dsi*.ko
 
-      - name: List Output (For verification)
+      - name: List Output
         run: |
           ls -lh drivers/gpu/drm/panel/*.ko
