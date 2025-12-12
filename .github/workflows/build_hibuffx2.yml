@@ -1,232 +1,335 @@
-name: Manual Build (Cached Toolchain & Session)
+name: Build Hibuffx AP6212 Image (pro2)
 
 on:
   workflow_dispatch:
     inputs:
-      # 1. 会话密钥：决定是“复用旧缓存”还是“开新坑”
-      cache_session_key:
-        description: '会话 Key (用于识别缓存，如 debug01)'
-        required: true
-        default: 'dev-session-01'
-        type: string
-      
-      # 2. 编译选项：按需勾选
-      do_build_kernel:
-        description: '编译 Kernel Image'
-        required: false
-        default: true
-        type: boolean
-      do_build_modules:
-        description: '编译 Modules (.ko)'
-        required: false
-        default: true
-        type: boolean
-      do_build_dtbs:
-        description: '编译 DTBs'
-        required: false
-        default: true
-        type: boolean
-
-      # 3. Git源
       target_tag:
-        description: 'Git Tag/Branch'
+        description: 'Source tag to build from'
         required: true
         default: 'vincentTea-hibuffx'
+      
+      reuse_kernel_img:
+        description: '[加速] Image URL (复用内核)'
+        required: false
+      reuse_build_deps:
+        description: '[加速] build-deps.tar.gz URL (复用配置)'
+        required: false
+      reuse_modules_tar:
+        description: '[加速] modules.tar.gz URL (复用模块)'
+        required: false
 
 env:
   ARCH: arm64
-  # 设置中国时区，用于 Release 标题
-  TZ: Asia/Shanghai
-  # 工具链版本定义，方便后续升级修改
-  TOOLCHAIN_URL: "https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz"
-  TOOLCHAIN_DIR: "arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu"
+  DTB_STANDARD: rk3566-lckfb-tspi
+  CUSTOM_SUFFIX: hibuffx
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      # === 1. 拉取代码 ===
       - name: Checkout Source
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.target_tag }}
+          ref: ${{ github.event.inputs.target_tag }}
           submodules: true
           fetch-depth: 0
+          persist-credentials: false
 
-      # === 2. 恢复编译缓存 (Session Cache) ===
-      - name: Restore CCache (Compile Cache)
-        uses: actions/cache/restore@v4
-        id: restore-ccache
-        with:
-          path: ~/.cache/ccache
-          # Key 包含 run_id 确保生成新槽位，restore-keys 确保能找到旧缓存
-          key: ccache-${{ inputs.cache_session_key }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ inputs.cache_session_key }}-
-
-      # === 3. 准备环境 & 缓存工具链 (关键优化) ===
-      - name: Setup System Deps
+      - name: Initialize Release
+        id: create_release
         run: |
-          # 快速安装系统小工具 (通常 <30秒)
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ccache pigz device-tree-compiler u-boot-tools libssl-dev bc flex bison libncurses-dev python3-pyelftools
+          TAG_NAME="Hibuffx-$(TZ=Asia/Shanghai date +'%Y%m%d-%H%M')"
+          echo "RELEASE_TAG=$TAG_NAME" >> $GITHUB_ENV
           
-          # 创建 ccache 目录
-          mkdir -p ~/.cache/ccache
-          # 设置 ccache 大小 (5G 足够内核使用)
-          export PATH="/usr/lib/ccache:$PATH"
-          ccache --max-size=5G
+          gh release create "$TAG_NAME" \
+            --title "Hibuffx Build $TAG_NAME (CST)" \
+            --notes "DTS: Full Rockchip Set. Firmware: TSPI AP6212. Build Time: $(TZ=Asia/Shanghai date)" \
+            --draft=false \
+            --prerelease=false \
+            -R ${{ github.repository }}
 
-      # [方案A核心]：尝试恢复工具链缓存
-      - name: Cache Toolchain
-        id: cache-toolchain
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.TOOLCHAIN_DIR }}
-          # 只要 URL 不变，缓存就永久有效
-          key: toolchain-${{ env.TOOLCHAIN_URL }}
-
-      # [方案A核心]：如果没命中缓存，才下载 (省去几百MB下载解压时间)
-      - name: Download Toolchain (If missed)
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+      - name: Install Tools & Deps
         run: |
-          echo ">>> Toolchain cache miss. Downloading..."
-          wget -q ${{ env.TOOLCHAIN_URL }} -O toolchain.tar.xz
-          echo ">>> Extracting..."
-          tar -xf toolchain.tar.xz
-          rm toolchain.tar.xz
-
-      # 配置 PATH，让系统找到 gcc
-      - name: Setup Compiler Path
-        run: |
-          TC_BIN="$(pwd)/${{ env.TOOLCHAIN_DIR }}/bin"
-          echo "$TC_BIN" >> $GITHUB_PATH
-          echo "Toolchain path added: $TC_BIN"
-
-      # === 4. 配置内核 ===
-      - name: Configure Kernel
-        run: |
-          # 注入 ccache 到 PATH 头部
-          export PATH="/usr/lib/ccache:$PATH"
+          chmod +x scripts/mkimg scripts/resource_tool scripts/mkbootimg scripts/* || true
           
-          # 生成配置
+          LZ4_LATEST=$(curl -s https://api.github.com/repos/lz4/lz4/releases/latest | grep 'tarball_url' | cut -d\" -f4)
+          wget $LZ4_LATEST -O lz4.tar.gz && tar -xzf lz4.tar.gz && cd lz4-lz4-* && make -j$(nproc) && sudo make install && sudo ldconfig
+          
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler u-boot-tools libssl-dev bc flex bison libncurses-dev initramfs-tools busybox-static tree
+          sudo -E apt-get -y install $(curl -fsSL https://tinyurl.com/ubuntu2204-build-armbian)
+          
+          wget https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
+          tar xf arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu.tar.xz
+          echo "$(pwd)/arm-gnu-toolchain-14.2.rel1-x86_64-aarch64-none-linux-gnu/bin" >> $GITHUB_PATH
+
+      - name: Setup Dynamic Paths
+        run: |
+          WORK_DIR="${{ github.workspace }}"
+          echo "src_path=$WORK_DIR" >> $GITHUB_ENV
+          echo "modules_install_path=$WORK_DIR/modules_install" >> $GITHUB_ENV
+          echo "armbian_path=$WORK_DIR/armbian_boot" >> $GITHUB_ENV
+          echo "dtb_path=$WORK_DIR/dtbs" >> $GITHUB_ENV
+          echo "armbian_file_path=$WORK_DIR/armbian_boot_files" >> $GITHUB_ENV
+          mkdir -p "$WORK_DIR/modules_install" "$WORK_DIR/armbian_boot" "$WORK_DIR/armbian_boot_files" "$WORK_DIR/dtbs"
+
+      # === 核心策略：Git Commit 法去除 Dirty ===
+      - name: Configure Kernel & Clean Git State
+        run: |
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- tspi_defconfig
           
-          # 准备 modules 环境 (即使不编 Image 也要做，防止 modpost 报错)
-          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
+          echo ">>> [策略] 执行 Git Commit 以清除 Dirty 状态..."
+          git config --global user.email "support@hibuffx.com"
+          git config --global user.name "HiBuffxEngineer"
+          git add .
+          git commit -m "Auto-commit to clean dirty state" || echo "No changes to commit"
 
-      # === 5. 按需编译 ===
-      
-      # [Kernel Image]
-      - name: Build Kernel Image
-        if: ${{ inputs.do_build_kernel == true }}
+      # === Kernel Image & Build Deps (核心修改点) ===
+      - name: Process Kernel Image
         run: |
-          export PATH="/usr/lib/ccache:$PATH"
-          echo ">>> Building Image (Parallel)..."
-          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
+          IMG_URL="${{ github.event.inputs.reuse_kernel_img }}"
+          DEPS_URL="${{ github.event.inputs.reuse_build_deps }}"
+          
+          if [[ -n "$IMG_URL" ]] && [[ -n "$DEPS_URL" ]]; then
+            echo ">>> [加速] 下载 Image 和 依赖..."
+            wget -O arch/arm64/boot/Image "$IMG_URL"
+            wget -O build-deps.tar.gz "$DEPS_URL"
+            
+            echo ">>> [恢复] 解压构建环境..."
+            # 使用 -p 保留权限（关键：脚本的可执行位），-x 解压
+            tar -xpzf build-deps.tar.gz
+            
+            # 关键：更新 .config 时间戳，防止 make 误判需要重新配置
+            touch .config
+            
+            echo ">>> [检查] 验证环境完整性..."
+            # 因为保留了 scripts/ 下的二进制文件，这一步应该极快
+            make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
+          else
+            echo ">>> [全量] 编译 Image..."
+            make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
+            
+            # 确保符号表存在
+            if [ ! -f "Module.symvers" ]; then
+                make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
+            fi
 
-      # [Modules]
-      - name: Build Modules
-        if: ${{ inputs.do_build_modules == true }}
-        run: |
-          export PATH="/usr/lib/ccache:$PATH"
-          echo ">>> Building Modules..."
-          # ccache 会自动跳过已编译且未修改的 .o 文件
-          make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules -j$(nproc)
+            if [ -f "arch/arm64/boot/Image" ]; then
+                gh release upload ${{ env.RELEASE_TAG }} arch/arm64/boot/Image --clobber -R ${{ github.repository }}
+            fi
+            
+            # --- [优化打包策略] ---
+            echo ">>> [清理] 准备打包依赖环境..."
+            
+            # 1. 删除 .git 目录（巨大且复用时无用）
+            rm -rf .git
+            
+            # 2. 删除 drivers, fs, net 等源码目录下的 .o 和 .a 文件 (节省空间)
+            # 关键：排除 scripts, tools, include, arch 目录，保留构建工具和架构相关对象
+            echo "Removing unnecessary object files..."
+            find . -type f \( -name "*.o" -o -name "*.a" \) \
+                -not -path "./scripts/*" \
+                -not -path "./tools/*" \
+                -not -path "./arch/arm64/include/*" \
+                -not -path "./include/*" \
+                -delete
+            
+            # 3. 删除未被使用的临时文件
+            find . -name "*.cmd" -delete
+            find . -name "*.tmp" -delete
+            
+            echo ">>> [打包] 构建完整依赖包 (包含 vmlinux 和 scripts)..."
+            # 4. 打包当前目录所有内容 (保留了目录结构、vmlinux、scripts二进制、include等)
+            # 排除自身防止递归
+            tar -zcf build-deps.tar.gz --exclude=build-deps.tar.gz . 
 
-      # [DTBs]
-      - name: Build DTBs
-        if: ${{ inputs.do_build_dtbs == true }}
+            gh release upload ${{ env.RELEASE_TAG }} build-deps.tar.gz --clobber -R ${{ github.repository }}
+          fi
+
+      # === Modules ===
+      - name: Process Modules
         run: |
-          export PATH="/usr/lib/ccache:$PATH"
-          echo ">>> Building DTBs..."
+          MOD_URL="${{ github.event.inputs.reuse_modules_tar }}"
+          
+          if [[ -n "$MOD_URL" ]]; then
+            echo ">>> [极速] 下载 Modules..."
+            wget -O modules.tar.gz "$MOD_URL"
+            tar -xzf modules.tar.gz -C ${{ env.modules_install_path }}
+          else
+            echo ">>> [编译] Modules..."
+            # 这里即使在 reuse 模式下，由于上一步恢复了完整环境，modules_prepare 也是安全的
+            if [ ! -f "Module.symvers" ]; then
+               make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
+            fi
+            make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules -j$(nproc)
+            make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_install INSTALL_MOD_PATH=${{ env.modules_install_path }}
+          fi
+          
+          if [ -d "${{ env.modules_install_path }}/lib/modules" ]; then
+              CD_PATH="${{ env.modules_install_path }}/lib/modules"
+          else
+              CD_PATH="${{ env.modules_install_path }}"
+          fi
+          
+          REAL_VER=$(ls $CD_PATH | head -n 1)
+          echo "REAL_VER=$REAL_VER" >> $GITHUB_ENV
+          echo "kernel_main_version=$REAL_VER" >> $GITHUB_ENV
+          
+          if [[ -z "$MOD_URL" ]]; then
+            tar -zcf modules-$REAL_VER.tar.gz -C $CD_PATH $REAL_VER
+            gh release upload ${{ env.RELEASE_TAG }} modules-$REAL_VER.tar.gz --clobber -R ${{ github.repository }}
+          fi
+
+      # === Build All DTBs & Boot Image ===
+      - name: Build All DTBs & Boot Image
+        run: |
+          echo ">>> [编译] 编译所有 DTBs..."
           make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- dtbs -j$(nproc)
+          
+          echo ">>> [打包] 独立 DTB 包 (dtbs-with-overlay.tar.gz)..."
+          cd arch/arm64/boot/dts/rockchip/
+          find . -type f \( -name "*.dtb" -o -name "*.dtbo" \) > ../../../../../dtb-filelist.txt
+          tar -zcvf ../../../../../dtbs-with-overlay.tar.gz -T ../../../../../dtb-filelist.txt
+          
+          cp rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}.dtb ../../../../../target_dtb.dtb
+          cd ../../../../../
+          
+          gh release upload ${{ env.RELEASE_TAG }} dtbs-with-overlay.tar.gz --clobber -R ${{ github.repository }}
+          
+          echo ">>> [制作] 制作 boot.img..."
+          ./scripts/resource_tool target_dtb.dtb
+          ./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
+          
+          BOOT_NAME="rk3566-lckfb-tspi-${{ env.CUSTOM_SUFFIX }}-boot-${{ env.REAL_VER }}.img"
+          mv boot.img $BOOT_NAME
+          gh release upload ${{ env.RELEASE_TAG }} $BOOT_NAME --clobber -R ${{ github.repository }}
+          echo "BOOT_IMG_NAME=$BOOT_NAME" >> $GITHUB_ENV
 
-      # === 6. 打包产物 ===
-      - name: Package Artifacts
-        id: package
+      # === Package Firmware ===
+      - name: Package Firmware (TSPI Specific)
         run: |
-          mkdir output_dist
+          cd ${{ env.src_path }}
+          mkdir -p temp_fw_pack
           
-          # 1. 打包 Image
-          if [ -f "arch/arm64/boot/Image" ]; then
-             cp arch/arm64/boot/Image output_dist/
-             echo "Packaged: Image"
+          if [ -d "tspi_wifi_firmware" ]; then
+             cp -r tspi_wifi_firmware/* temp_fw_pack/
+          elif [ -d "firmware" ]; then
+             cp -r firmware/* temp_fw_pack/
+          else
+             echo "Missing firmware" > temp_fw_pack/missing.txt
           fi
           
-          # 2. 打包 DTBs
-          # 检查是否有 dtb 文件生成
-          if ls arch/arm64/boot/dts/rockchip/*.dtb 1> /dev/null 2>&1; then
-             # 使用 pigz 加速压缩
-             tar --use-compress-program=pigz -cf output_dist/dtbs.tar.gz arch/arm64/boot/dts/rockchip/*.dtb
-             echo "Packaged: dtbs.tar.gz"
+          cd temp_fw_pack
+          if [ -f "brcmfmac43438a1-sdio.txt" ] && [ ! -f "nvram.txt" ]; then
+              cp brcmfmac43438a1-sdio.txt nvram.txt
           fi
           
-          # 3. 打包 Modules
-          if [ "${{ inputs.do_build_modules }}" == "true" ]; then
-             mkdir -p temp_mod_install
-             # 安装 modules 到临时目录
-             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_install INSTALL_MOD_PATH=temp_mod_install
-             
-             # 提取版本号 (如 6.1.75-hibuffx)
-             KVER=$(ls temp_mod_install/lib/modules | head -n1)
-             
-             if [ -n "$KVER" ]; then
-                tar --use-compress-program=pigz -cf output_dist/modules-$KVER.tar.gz -C temp_mod_install/lib/modules $KVER
-                echo "Packaged: modules-$KVER.tar.gz"
+          cd ..
+          tar -zcf ap6212_wifi_firmware.tar.gz -C temp_fw_pack .
+          
+          # Headers (Clean headers for end-users, distinct from build-deps)
+          KVER=${{ env.REAL_VER }}
+          HEADER_DIR="linux-headers-$KVER"
+          mkdir -p $HEADER_DIR/arch/arm64
+          cp -a Module.symvers Makefile scripts include .config $HEADER_DIR/ || true
+          cp -a arch/arm64/include arch/arm64/kvm arch/arm64/Makefile $HEADER_DIR/arch/arm64/ || true
+          tar -zcf linux-headers-$KVER.tar.gz $HEADER_DIR
+
+      # === Process Armbian DTB ===
+      - name: Process Armbian DTB
+        run: |
+          # 1. 创建 Armbian 期望的目录结构： dtb/rockchip
+          mkdir -p ${{ env.dtb_path }}/dtb/rockchip
+          
+          # 2. 进入编译好的 DTB 目录
+          cd arch/arm64/boot/dts/rockchip
+          
+          echo ">>> [复制] 将所有编译好的 .dtb 和 .dtbo 复制到打包目录..."
+          find . -type f \( -name "*.dtb" -o -name "*.dtbo" \) -exec cp --parents {} ${{ env.dtb_path }}/dtb/rockchip/ \;
+          
+          # 3. 打包
+          cd ${{ env.dtb_path }}
+          tar -zcf dtb-rockchip-${{ env.REAL_VER }}.tar.gz dtb
+          mv dtb-rockchip-${{ env.REAL_VER }}.tar.gz ${{ env.armbian_path }}/
+
+      # === Initrd (Chroot) ===
+      - name: Build Initrd (Chroot)
+        run: |
+          KVER=${{ env.REAL_VER }}
+          sudo mkdir -p /mnt/chroot/lib/modules /mnt/chroot/usr/src /mnt/chroot/boot
+          
+          if [ -d "${{ env.modules_install_path }}/lib/modules/$KVER" ]; then
+             sudo cp -a ${{ env.modules_install_path }}/lib/modules/$KVER /mnt/chroot/lib/modules/
+          else
+             sudo cp -a ${{ env.modules_install_path }}/$KVER /mnt/chroot/lib/modules/
+          fi
+          
+          sudo apt-get update
+          sudo apt-get install -y debootstrap qemu-user-static
+          sudo debootstrap --arch=arm64 --variant=minbase jammy /mnt/chroot http://ports.ubuntu.com/
+          
+          sudo cp /usr/bin/qemu-aarch64-static /mnt/chroot/usr/bin/
+          sudo mount -t proc proc /mnt/chroot/proc
+          sudo mount -t sysfs sys /mnt/chroot/sys
+          sudo mount -o bind /dev /mnt/chroot/dev
+          
+          sudo chroot /mnt/chroot /bin/bash <<EOF
+          apt-get update
+          apt-get install -y initramfs-tools u-boot-tools busybox-static kmod linux-base
+          sed -i "s|^update_initramfs=.*|update_initramfs=no|g" /etc/initramfs-tools/update-initramfs.conf
+          sed -i "s|^COMPRESS=.*|COMPRESS=gzip|g" /etc/initramfs-tools/initramfs.conf
+          update-initramfs -c -k $KVER
+          mkimage -A arm64 -O linux -T ramdisk -C gzip -a 0 -e 0 -n uInitrd -d /boot/initrd.img-$KVER /boot/uInitrd-$KVER
+          EOF
+          
+          sudo cp /mnt/chroot/boot/initrd.img-$KVER ${{ env.armbian_file_path }}/
+          sudo cp /mnt/chroot/boot/uInitrd-$KVER ${{ env.armbian_file_path }}/
+          
+          sudo umount /mnt/chroot/dev /mnt/chroot/proc /mnt/chroot/sys
+          sudo rm -rf /mnt/chroot
+
+      # === Final Packaging (Armbian) ===
+      - name: Final Packaging (Armbian)
+        run: |
+          KVER=${{ env.REAL_VER }}
+          cp arch/arm64/boot/Image ${{ env.armbian_file_path }}/vmlinuz-$KVER
+          cp System.map ${{ env.armbian_file_path }}/System.map-$KVER
+          cp .config ${{ env.armbian_file_path }}/config-$KVER
+          
+          cd ${{ env.armbian_file_path }}
+          sudo chown -R runner:runner .
+          tar -zcf boot-$KVER.tar.gz *
+          mv boot-$KVER.tar.gz ${{ env.armbian_path }}/
+          
+          cd ${{ env.armbian_path }}
+          mv ${{ env.src_path }}/ap6212_wifi_firmware.tar.gz .
+          mv ${{ env.src_path }}/linux-headers-$KVER.tar.gz headers-$KVER.tar.gz
+          
+          if [ -f "modules-$KVER.tar.gz" ]; then
+             echo "Using existing modules tar"
+          else
+             if [ -d "${{ env.modules_install_path }}/lib/modules/$KVER" ]; then
+                 tar -zcf modules-$KVER.tar.gz -C ${{ env.modules_install_path }}/lib/modules $KVER
+             else
+                 tar -zcf modules-$KVER.tar.gz -C ${{ env.modules_install_path }} $KVER
              fi
           fi
           
-          echo "dist_path=$(pwd)/output_dist" >> $GITHUB_ENV
+          tar -zcf armbian_boot-$KVER.tar.gz *
+          gh release upload ${{ env.RELEASE_TAG }} armbian_boot-$KVER.tar.gz --clobber -R ${{ github.repository }}
 
-      # === 7. 发布 Release ===
-      
-      # [新增步骤] 先生成 Tag 和标题，存入环境变量
-      - name: Generate Release Info
-        id: release_info
+      # === Final Packaging (Flashable) ===
+      - name: Final Packaging (Flashable)
         run: |
-          # 计算当前时间戳
-          TIMESTAMP=$(date +'%s')
-          # 计算可读时间 (中国时间)
-          READABLE_TIME=$(date +'%Y-%m-%d %H:%M:%S')
+          KVER=${{ env.REAL_VER }}
+          mkdir -p final_pack
+          cd final_pack
           
-          # 组合 Tag 名字 (如: build-debug01-1715500000)
-          TAG_NAME="build-${{ inputs.cache_session_key }}-${TIMESTAMP}"
+          mv ${{ env.src_path }}/${{ env.BOOT_IMG_NAME }} .
+          cp ${{ env.armbian_path }}/modules-$KVER.tar.gz .
+          cp ${{ env.armbian_path }}/headers-$KVER.tar.gz .
+          cp ${{ env.armbian_path }}/ap6212_wifi_firmware.tar.gz .
           
-          # 组合标题名字
-          RELEASE_NAME="[${{ inputs.cache_session_key }}] @ ${READABLE_TIME}"
-          
-          # 写入环境变量，供下一步骤使用
-          echo "GEN_TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
-          echo "GEN_RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
-          
-          echo "Generated Tag: $TAG_NAME"
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v1
-        with:
-          # [修改] 这里直接引用上面生成的环境变量
-          name: ${{ env.GEN_RELEASE_NAME }}
-          tag_name: ${{ env.GEN_TAG_NAME }}
-          
-          files: ${{ env.dist_path }}/*
-          body: |
-            ### Build Information
-            - **Session Key**: `${{ inputs.cache_session_key }}`
-            - **Build Time**: $(date)
-            - **Components**:
-              - Kernel: ${{ inputs.do_build_kernel }}
-              - Modules: ${{ inputs.do_build_modules }}
-              - DTBs: ${{ inputs.do_build_dtbs }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # === 8. [最重要] 强制保存编译缓存 ===
-      # 无论上面是否编译失败 (if: always)，都保存当前的 .o 文件
-      - name: Save CCache (Always)
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: ~/.cache/ccache
-          # Key 对应 Restore 步骤，下次 Restore 就能找到它
-          key: ccache-${{ inputs.cache_session_key }}-${{ github.run_id }}
+          tar -zcvf rk3566-tspi-${{ env.CUSTOM_SUFFIX }}-$KVER.tar.gz *
+          gh release upload ${{ env.RELEASE_TAG }} rk3566-tspi-${{ env.CUSTOM_SUFFIX }}-$KVER.tar.gz --clobber -R ${{ github.repository }}
