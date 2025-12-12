@@ -1,0 +1,76 @@
+name: Quick Debug Panel Driver (.ko only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: 'Git Branch/Tag to build from'
+        required: true
+        default: 'vincentTea-hibuffx'
+      deps_url:
+        description: 'URL of build-deps.tar.gz from previous full build'
+        required: true
+        default: ''
+
+env:
+  ARCH: arm64
+  # 使用相对路径，简化配置
+  CROSS_COMPILE: aarch64-none-linux-gnu-
+
+jobs:
+  quick-build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_tag }}
+          submodules: false # 调试驱动通常不需要 submodule，省时间
+          fetch-depth: 1
+
+      - name: Install Compiler & Tools
+        run: |
+          # 为了极速，这里直接用 apt 安装编译器，通常足够编译 6.x 内核
+          # 如果必须用特定版本，可以保留你原有的下载步骤，但会慢几分钟
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu build-essential libssl-dev bc bison flex wget
+          
+          # 验证编译器版本
+          aarch64-linux-gnu-gcc --version
+
+      - name: Restore Build Environment
+        run: |
+          echo ">>> Downloading Build Deps..."
+          wget -O build-deps.tar.gz "${{ github.event.inputs.deps_url }}"
+          
+          echo ">>> Extracting..."
+          # 解压到当前目录，恢复 .config 和 Module.symvers
+          tar -xzf build-deps.tar.gz
+          
+          # 简单验证
+          if [ ! -f ".config" ]; then
+            echo "Error: .config not found in deps!"
+            exit 1
+          fi
+
+      - name: Prepare Kernel Tree
+        run: |
+          # 准备构建环境 (modules_prepare 会生成必要的头文件和 scripts)
+          # 注意：CROSS_COMPILE 使用 apt 安装的路径前缀
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc)
+
+      - name: Compile Panel Driver Only
+        run: |
+          echo ">>> Compiling Panel Driver..."
+          # 只编译 drivers/gpu/drm/panel 目录
+          make ARCH=$ARCH CROSS_COMPILE=aarch64-linux-gnu- M=drivers/gpu/drm/panel modules -j$(nproc)
+
+      - name: Locate & Upload KO
+        uses: actions/upload-artifact@v4
+        with:
+          name: panel-rockchip-dsi-debug
+          path: drivers/gpu/drm/panel/panel-rockchip-dsi*.ko
+
+      - name: List Output (For verification)
+        run: |
+          ls -lh drivers/gpu/drm/panel/*.ko
