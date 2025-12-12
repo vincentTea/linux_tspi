@@ -1,4 +1,4 @@
-name: Build Hibuffx AP6212 Image (pro2)
+name: Build Hibuffx AP6212 Image (debug modules)
 
 on:
   workflow_dispatch:
@@ -85,7 +85,7 @@ jobs:
           git add .
           git commit -m "Auto-commit to clean dirty state" || echo "No changes to commit"
 
-      # === Kernel Image & Build Deps (核心修改点) ===
+      # === Kernel Image & Build Deps (终极修复版) ===
       - name: Process Kernel Image
         run: |
           IMG_URL="${{ github.event.inputs.reuse_kernel_img }}"
@@ -97,7 +97,10 @@ jobs:
             wget -O build-deps.tar.gz "$DEPS_URL"
             
             echo ">>> [恢复] 解压构建环境..."
+            # 使用 -p 保留权限，这对 scripts 至关重要
             tar -xpzf build-deps.tar.gz
+            
+            # 更新时间戳防止 make 重新配置
             touch .config
             
             echo ">>> [检查] 验证环境完整性..."
@@ -106,6 +109,7 @@ jobs:
             echo ">>> [全量] 编译 Image..."
             make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- Image -j$(nproc)
             
+            # 确保 Module.symvers 存在
             if [ ! -f "Module.symvers" ]; then
                 make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
             fi
@@ -116,10 +120,12 @@ jobs:
             
             # --- [优化打包策略] ---
             echo ">>> [清理] 准备打包依赖环境..."
+            
+            # 1. 删除 .git 目录 (巨大且无用)
             rm -rf .git
             
+            # 2. 智能清理：删除 drivers, fs 等源码目录下的 .o 文件，但保留 scripts, include, arch, tools
             echo "Removing unnecessary object files..."
-            # 排除 scripts, tools, include, arch, .config, Makefile 等关键文件
             find . -type f \( -name "*.o" -o -name "*.a" \) \
                 -not -path "./scripts/*" \
                 -not -path "./tools/*" \
@@ -127,22 +133,23 @@ jobs:
                 -not -path "./include/*" \
                 -delete
             
+            # 3. 删除临时文件
             find . -name "*.cmd" -delete
             find . -name "*.tmp" -delete
             
             echo ">>> [打包] 构建完整依赖包..."
-            # 【关键修复】
-            # 1. 写入 /tmp 避免 "file changed" 错误
-            # 2. 这里的 || [ $? -eq 1 ] 允许 tar 返回 1 (warning) 而不中断流程
-            # 3. --warning=no-file-changed 试图抑制该警告（GNU tar特性）
+            # 【关键修改】
+            # 1. 写入到 /tmp/ 下，避免打包过程修改当前目录导致 "file changed" 错误
+            # 2. 添加 || [ $? -eq 1 ] 逻辑：如果 tar 返回 1 (warning)，视为成功继续执行；如果返回 2 (fatal)，则报错
+            # 3. 添加 --warning=no-file-changed 抑制该类警告
+            
             tar -zcf /tmp/build-deps.tar.gz . \
                 --warning=no-file-changed \
-                --exclude=.git \
                 || [ $? -eq 1 ]
             
-            # 将打包好的文件移回当前目录
+            # 将生成的包移回工作目录以便上传
             mv /tmp/build-deps.tar.gz .
-
+            
             gh release upload ${{ env.RELEASE_TAG }} build-deps.tar.gz --clobber -R ${{ github.repository }}
           fi
 
@@ -157,7 +164,7 @@ jobs:
             tar -xzf modules.tar.gz -C ${{ env.modules_install_path }}
           else
             echo ">>> [编译] Modules..."
-            # 这里即使在 reuse 模式下，由于上一步恢复了完整环境，modules_prepare 也是安全的
+            # 复用模式下，环境已由上一步完全恢复，直接编译
             if [ ! -f "Module.symvers" ]; then
                make ARCH=$ARCH CROSS_COMPILE=aarch64-none-linux-gnu- modules_prepare
             fi
