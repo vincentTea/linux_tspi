@@ -34,7 +34,7 @@
 #include <linux/of_gpio.h>
 #include <linux/gpio.h>
 #include <linux/slab.h>
-#include "../tp_suspend.h"
+#include "tp_suspend.h"
 
 //#include <mach/gpio.h>
 //#include <linux/earlysuspend.h>
